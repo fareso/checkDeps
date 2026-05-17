@@ -1,0 +1,2 @@
+[console_scripts]
+checkdeps = checkdeps:main

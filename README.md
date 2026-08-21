@@ -6,7 +6,7 @@ A command-line tool that scans a project's dependency files and checks every dec
 
 | File | Ecosystem |
 |---|---|
-| `pom.xml` | Maven (Java) |
+| `pom.xml` | Maven (Java) — resolved by Maven itself, see below |
 | `package.json` | npm (Node.js) |
 | `requirements.txt` | pip (Python) |
 | `Pipfile` / `Pipfile.lock` | Pipenv (Python) |
@@ -97,6 +97,9 @@ checkdeps pom.xml package.json   # scan specific files
 | `--sys-platform NAME` | `sys_platform` used to evaluate PEP 508 markers (default: this platform) |
 | `--marker-env NAME=VALUE` | Any other PEP 508 marker variable; repeatable |
 | `--resolve-from-env` | Take exact versions from the installed environment where a requirement does not pin one |
+| `--verbose` | List the resolved Maven dependency graph, and show Maven's own output when resolution fails |
+| `--no-maven` | Never execute Maven; analyse `pom.xml` statically instead |
+| `--maven-timeout SECONDS` | Time budget for one Maven resolution (default: 300) |
 
 ### Examples
 
@@ -112,6 +115,9 @@ checkdeps --format json --min-severity CRITICAL --fail-on-vuln
 
 # Evaluate environment markers for a Linux / Python 3.11 deployment target
 checkdeps --python-version 3.11 --sys-platform linux
+
+# Show the full Maven dependency graph that was resolved and scanned
+checkdeps ./backend --verbose
 ```
 
 ## How it works
@@ -123,6 +129,37 @@ checkdeps --python-version 3.11 --sys-platform linux
 5. **Verify** — re-checks each advisory's affected range against the resolved version using PEP 440 comparison, and drops hits the range does not actually cover
 6. **Cache** — results are stored in `~/.checkDeps/cache.json` with a 2-day TTL; subsequent runs skip the API for any package+version already cached
 7. **Report** — displays a colour-coded table sorted by severity (CRITICAL → HIGH → MEDIUM → LOW), showing the CVE/GHSA ID, summary, and publish date for each finding, followed by anything that could not be matched
+
+## Maven dependency resolution
+
+A `pom.xml` rarely states the versions a Java application actually runs. They come from parent POMs, `dependencyManagement`, imported BOMs and `${properties}`, and most of the graph is transitive — never named in the file at all. So checkdeps asks Maven, which is the only thing that knows:
+
+```text
+Parsing dependency files...
+  Maven detected: backend\mvnw.cmd
+  Resolving backend\pom.xml with Maven (runs the project's own build tooling)...
+  ok backend\pom.xml
+     14 direct dependencies
+     49 transitive dependencies
+     63 resolved dependencies
+```
+
+No flag is needed — a resolved graph is simply what a Maven project *is*.
+
+- **The Maven Wrapper wins.** `mvnw.cmd` / `mvnw` is the Maven version the project itself pins, so it is searched for first (up to the reactor root, where multi-module builds keep it) before `mvn` on `PATH`.
+- **Only `dependency:tree` is run**, with a pinned plugin version and JSON output, never `package`, `install`, `verify` or `test`. Maven is invoked as an argument list without a shell, in the POM's own directory, under a timeout, with its output captured. It still executes the project's build tooling, though — `--no-maven` turns that off and falls back to static parsing.
+- **Maven's answer is used as-is.** Versions chosen by dependency mediation are the versions scanned; checkdeps does not re-implement Maven's resolution rules.
+- **Direct and transitive dependencies are both scanned**, and each record keeps its Maven scope. Vulnerabilities usually arrive transitively, so scanning only what the POM names would miss most of them.
+- **Anything Maven cannot do falls back**, never fails: no Maven installed, no wrapper, a plugin that will not run, an unreachable repository or an artifact that cannot be resolved all produce a one-line warning and the static `pom.xml` analysis that checkdeps did before.
+
+```text
+  warning Maven dependency resolution failed (MAVEN_DEPENDENCY_RESOLUTION_FAILED)
+  reason: Could not resolve artifact com.example:internal-lib:2.1.0
+  Falling back to static POM analysis...
+  ok backend\pom.xml  (14 deps, 10 unresolved)
+```
+
+Maven's own log is only printed with `--verbose`. The same resolved package/version found in several modules becomes a single OSV query, with every module that uses it kept in the JSON output's `sources`.
 
 ## Python dependency parsing
 
@@ -155,6 +192,8 @@ Requirements that fail to parse are reported as errors with their file and line 
   "errors":     [ { "kind": "parse_error", "source": "...", "line": 9 } ]
 }
 ```
+
+Maven-resolved records additionally carry `scope`, `direct`, `type`, `classifier` and `sources` (every module the package/version was resolved in).
 
 ## Tests
 

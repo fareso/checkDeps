@@ -11,6 +11,12 @@ Supported files:
   Cargo.toml         Cargo (Rust)
   go.mod             Go modules
 
+Maven projects are resolved by Maven itself: when a pom.xml is found, the
+project's Maven Wrapper (or mvn from PATH) is asked for the dependency tree, so
+versions inherited from parent POMs, BOMs, dependencyManagement and properties
+are real, and transitive dependencies are scanned too.  Static pom.xml parsing
+remains the fallback for when Maven cannot be run.
+
 Python dependencies are extracted with a real PEP 508 parser: extras, version
 specifiers and environment markers are kept as separate fields, names are
 canonicalised per PEP 503 and versions are compared per PEP 440.  A version is
@@ -22,8 +28,12 @@ Data source: OSV (https://osv.dev) -- free, no API key required.
 import argparse
 import importlib.metadata
 import json
+import os
 import re
+import shutil
+import subprocess
 import sys
+import tempfile
 import time
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -98,6 +108,11 @@ class Dependency:
     resolution: str | None = None   # how ``version`` was determined
     active: bool = True             # marker evaluated true for the target env
     raw: str | None = None
+    scope: str | None = None        # Maven scope: compile/runtime/provided/test
+    direct: bool = True             # declared by the project, not pulled in
+    artifact_type: str | None = None    # Maven <type>, e.g. jar / pom
+    classifier: str | None = None       # Maven <classifier>, when present
+    also_used_by: list = field(default_factory=list)  # further source files
 
     @property
     def resolved(self) -> bool:
@@ -108,6 +123,11 @@ class Dependency:
         if self.line:
             return f"{self.source_file}:{self.line}"
         return self.source_file
+
+    @property
+    def sources(self) -> list:
+        """Every manifest this exact package/version was found in."""
+        return [self.source_file, *self.also_used_by]
 
     @property
     def display_name(self) -> str:
@@ -152,6 +172,13 @@ class ParseReport:
     dependencies: list = field(default_factory=list)  # active, scannable
     inactive: list = field(default_factory=list)      # marker evaluated false
     issues: list = field(default_factory=list)
+
+    # Console lines belonging to one manifest: ``notes`` are printed before its
+    # "ok" line, ``detail`` replaces the usual "(N deps)" suffix underneath it.
+    # Both are consumed by the caller that parsed the file, so merge() -- which
+    # builds the scan-wide report -- deliberately leaves them behind.
+    notes: list = field(default_factory=list)
+    detail: list = field(default_factory=list)
 
     def merge(self, other: "ParseReport") -> None:
         self.dependencies.extend(other.dependencies)
@@ -728,10 +755,454 @@ def parse_pom_xml(path: Path) -> ParseReport:
         name = f"{group.text.strip()}:{artifact.text.strip()}"
         report.dependencies.append(
             Dependency(name, version, "Maven", str(path), is_dev=is_dev,
-                       resolution="manifest" if version else None)
+                       resolution="manifest" if version else None,
+                       scope=scope)
         )
     return report
 
+
+
+# ---------------------------------------------------------------------------
+# Maven resolution
+# ---------------------------------------------------------------------------
+
+# Maven -- not the raw pom.xml -- decides which artifacts a project actually
+# uses: parents, dependencyManagement, imported BOMs, ${properties} and
+# conflict mediation all live inside Maven's model.  So checkdeps asks Maven
+# for the resolved graph and keeps the XML parser above as the fallback for
+# when Maven cannot be run.
+
+MAVEN_DEPENDENCY_PLUGIN = "org.apache.maven.plugins:maven-dependency-plugin"
+# Pinned so the JSON output type is guaranteed to exist regardless of which
+# plugin version the project itself would otherwise select.
+MAVEN_DEPENDENCY_PLUGIN_VERSION = "3.8.1"
+MAVEN_TIMEOUT_SECONDS = 300
+
+MAVEN_SCOPES = {"compile", "provided", "runtime", "test", "system", "import"}
+# Scopes checkdeps treats as dev, matching what the static POM parser has
+# always done.  Kept as data so scope filtering can be added later.
+MAVEN_DEV_SCOPES = {"test", "provided"}
+
+
+class MavenErrorKind:
+    """Failure categories -- diagnostics match on these, not on log wording."""
+
+    NOT_FOUND = "MAVEN_NOT_FOUND"
+    TIMEOUT = "MAVEN_TIMEOUT"
+    EXECUTION_FAILED = "MAVEN_EXECUTION_FAILED"
+    DEPENDENCY_RESOLUTION_FAILED = "MAVEN_DEPENDENCY_RESOLUTION_FAILED"
+    OUTPUT_INVALID = "MAVEN_OUTPUT_INVALID"
+    PLUGIN_FAILED = "MAVEN_PLUGIN_FAILED"
+
+
+@dataclass
+class MavenCommand:
+    argv: list           # executable, as an argument list -- never a shell string
+    display: str         # what to show the user
+    source: str          # "wrapper" | "path"
+
+
+@dataclass
+class MavenResolution:
+    dependencies: list = field(default_factory=list)
+    command: MavenCommand | None = None
+    error: str | None = None      # a MavenErrorKind value when it went wrong
+    reason: str | None = None     # one concise line explaining the failure
+    output: str = ""              # captured Maven log, shown only with --verbose
+
+    @property
+    def ok(self) -> bool:
+        return self.error is None
+
+
+def find_maven_command(project_dir: Path) -> MavenCommand | None:
+    """
+    Locate a Maven to run for ``project_dir``, wrapper first.
+
+    The wrapper is the Maven version the project itself pins, so it resolves
+    more reproducibly than whatever happens to be on PATH.  It is searched for
+    up the directory tree because in a multi-module build it lives at the
+    reactor root, not next to every module's pom.xml.
+    """
+    wrappers = ("mvnw.cmd", "mvnw.bat") if os.name == "nt" else ("mvnw",)
+
+    try:
+        directory = project_dir.resolve()
+    except OSError:
+        directory = project_dir
+
+    for parent in [directory, *directory.parents]:
+        for name in wrappers:
+            candidate = parent / name
+            if candidate.is_file():
+                return MavenCommand([str(candidate)], str(candidate), "wrapper")
+
+    return maven_on_path()
+
+
+def maven_on_path() -> MavenCommand | None:
+    # shutil.which honours PATHEXT, so this finds mvn.cmd on Windows too.
+    found = shutil.which("mvn")
+    if found:
+        return MavenCommand([found], found, "path")
+    return None
+
+
+def _maven_command_line(command: MavenCommand, pom: Path, output_file: Path) -> list:
+    argv = [
+        *command.argv,
+        "-B",  # batch mode: no colour codes, no interactive prompts
+        f"{MAVEN_DEPENDENCY_PLUGIN}:{MAVEN_DEPENDENCY_PLUGIN_VERSION}:tree",
+        "-DoutputType=json",
+        f"-DoutputFile={output_file}",
+        # A reactor build writes one tree per module; without this they
+        # overwrite each other and only the last module survives.
+        "-DappendOutput=true",
+    ]
+    if pom.name != "pom.xml":
+        argv += ["-f", str(pom)]
+    return argv
+
+
+def _classify_maven_failure(output: str) -> tuple:
+    """Map a failed Maven run onto (MavenErrorKind, one-line reason)."""
+    lines = [line.strip() for line in output.splitlines() if line.strip()]
+    errors = [line for line in lines if line.startswith(("[ERROR]", "[FATAL]"))]
+
+    def first_matching(*needles) -> str | None:
+        for line in errors or lines:
+            lowered = line.lower()
+            if any(needle in lowered for needle in needles):
+                return re.sub(r"^\[(ERROR|FATAL)\]\s*", "", line).strip(" -")
+        return None
+
+    resolution_hit = first_matching(
+        "could not resolve dependencies",
+        "could not resolve artifact",
+        "could not find artifact",
+        "failure to find",
+        "non-resolvable parent pom",
+        "non-resolvable import pom",
+    )
+    if resolution_hit:
+        return MavenErrorKind.DEPENDENCY_RESOLUTION_FAILED, resolution_hit
+
+    plugin_hit = first_matching("plugin org.apache.maven.plugins", "no plugin found")
+    if plugin_hit:
+        return MavenErrorKind.PLUGIN_FAILED, plugin_hit
+
+    reason = ""
+    for line in errors:
+        reason = re.sub(r"^\[(ERROR|FATAL)\]\s*", "", line).strip()
+        if reason:
+            break
+    return MavenErrorKind.EXECUTION_FAILED, reason or "Maven exited with an error"
+
+
+def _parse_maven_id(raw) -> tuple | None:
+    """
+    Split a Maven coordinate string into its parts, or return None.
+
+    Accepts ``g:a:version``, ``g:a:type:version``, ``g:a:type:version:scope``
+    and ``g:a:type:classifier:version:scope`` -- the shapes plugin versions
+    older than the expanded JSON schema emit as a bare ``id``.
+    """
+    if not isinstance(raw, str):
+        return None
+    parts = [part.strip() for part in raw.split(":")]
+    if len(parts) < 3 or not all(parts[:3]):
+        return None
+    group, artifact = parts[0], parts[1]
+    rest = parts[2:]
+
+    scope = ""
+    # A trailing scope only ever follows a type, so a three-part tail is the
+    # shortest form that can carry one; that keeps a version named "test" safe.
+    if len(rest) >= 3 and rest[-1].lower() in MAVEN_SCOPES:
+        scope = rest.pop().lower()
+
+    version = rest[-1]
+    artifact_type = rest[0] if len(rest) >= 2 else ""
+    classifier = rest[1] if len(rest) >= 3 else ""
+    if not version:
+        return None
+    return group, artifact, version, artifact_type, classifier, scope
+
+
+def _maven_coordinates(node) -> dict | None:
+    """Read one dependency-tree node into plain coordinates, or None."""
+    if not isinstance(node, dict):
+        return None
+    group = str(node.get("groupId") or "").strip()
+    artifact = str(node.get("artifactId") or "").strip()
+    version = str(node.get("version") or "").strip()
+    scope = str(node.get("scope") or "").strip().lower()
+    artifact_type = str(node.get("type") or "").strip()
+    classifier = str(node.get("classifier") or "").strip()
+
+    if not (group and artifact and version):
+        parsed = _parse_maven_id(node.get("id"))
+        if parsed is None:
+            return None
+        group, artifact, version = parsed[0], parsed[1], parsed[2]
+        artifact_type = artifact_type or parsed[3]
+        classifier = classifier or parsed[4]
+        scope = scope or parsed[5]
+
+    return {
+        "groupId": group,
+        "artifactId": artifact,
+        "version": version,
+        "scope": scope if scope in MAVEN_SCOPES else "compile",
+        "type": artifact_type or "jar",
+        "classifier": classifier or None,
+    }
+
+
+def _load_maven_trees(text: str) -> list:
+    """
+    Decode the plugin's JSON output into one tree per Maven module.
+
+    With ``appendOutput`` a reactor build leaves several top-level objects in
+    the file, one after another, which is not a single JSON document.
+    """
+    decoder = json.JSONDecoder()
+    trees: list = []
+    index, length = 0, len(text)
+    while index < length:
+        while index < length and text[index].isspace():
+            index += 1
+        if index >= length:
+            break
+        try:
+            tree, index = decoder.raw_decode(text, index)
+        except ValueError as exc:
+            raise ValueError("Maven dependency tree was not valid JSON") from exc
+        trees.append(tree)
+    if not trees:
+        raise ValueError("Maven produced an empty dependency tree")
+    return trees
+
+
+def _dependencies_from_tree(tree, source: str, into: dict) -> None:
+    """
+    Walk one module's tree, adding its dependencies to ``into``.
+
+    The root node is the module itself and is skipped; its children are the
+    declared (direct) dependencies and everything below them is transitive.
+    Maven reports an artifact once per path that reaches it, so the first
+    record wins -- but reaching it directly later still promotes it.
+    """
+    if not isinstance(tree, dict):
+        return
+
+    def walk(node, direct: bool) -> None:
+        coords = _maven_coordinates(node)
+        if coords is None:
+            return
+        name = "{groupId}:{artifactId}".format(**coords)
+        key = (name, coords["version"], coords["classifier"])
+        existing = into.get(key)
+        if existing is not None:
+            existing.direct = existing.direct or direct
+            if source != existing.source_file and source not in existing.also_used_by:
+                existing.also_used_by.append(source)
+            return
+        into[key] = Dependency(
+            name=name,
+            version=coords["version"],
+            ecosystem="Maven",
+            source_file=source,
+            is_dev=coords["scope"] in MAVEN_DEV_SCOPES,
+            resolution="maven",
+            scope=coords["scope"],
+            direct=direct,
+            artifact_type=coords["type"],
+            classifier=coords["classifier"],
+        )
+        for child in node.get("children") or []:
+            walk(child, False)
+
+    for child in tree.get("children") or []:
+        walk(child, True)
+
+
+def resolve_maven_dependencies(pom: Path, command: MavenCommand | None = None,
+                               timeout: int = MAVEN_TIMEOUT_SECONDS
+                               ) -> MavenResolution:
+    """
+    Ask Maven for the resolved dependency graph of ``pom``.
+
+    Runs a single dependency-inspection goal -- never a lifecycle phase such as
+    package, install, verify or test -- with the pom's own directory as the
+    working directory, so the project's settings.xml, mirrors, credentials and
+    local repository apply exactly as they would to a normal build.
+    """
+    project_dir = pom.parent if str(pom.parent) else Path(".")
+    if command is None:
+        command = find_maven_command(project_dir)
+    if command is None:
+        return MavenResolution(
+            error=MavenErrorKind.NOT_FOUND,
+            reason="no Maven wrapper next to the project and no mvn on PATH",
+        )
+
+    handle, temp_name = tempfile.mkstemp(prefix="checkdeps-maven-", suffix=".json")
+    os.close(handle)
+    output_file = Path(temp_name)
+    try:
+        argv = _maven_command_line(command, pom, output_file)
+        try:
+            process = subprocess.run(
+                argv,
+                cwd=str(project_dir),
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            return MavenResolution(
+                command=command,
+                error=MavenErrorKind.TIMEOUT,
+                reason=f"Maven did not finish within {timeout}s",
+            )
+        except OSError as exc:
+            return MavenResolution(
+                command=command,
+                error=MavenErrorKind.NOT_FOUND,
+                reason=f"could not start {command.display}: {exc}",
+            )
+
+        output = (process.stdout or "") + (process.stderr or "")
+        if process.returncode != 0:
+            kind, reason = _classify_maven_failure(output)
+            return MavenResolution(command=command, error=kind, reason=reason,
+                                   output=output)
+
+        try:
+            raw = output_file.read_text(encoding="utf-8")
+        except OSError as exc:
+            return MavenResolution(
+                command=command,
+                error=MavenErrorKind.OUTPUT_INVALID,
+                reason=f"Maven wrote no dependency tree ({exc})",
+                output=output,
+            )
+
+        try:
+            trees = _load_maven_trees(raw)
+        except ValueError as exc:
+            return MavenResolution(
+                command=command,
+                error=MavenErrorKind.OUTPUT_INVALID,
+                reason=str(exc),
+                output=output,
+            )
+
+        collected: dict = {}
+        for tree in trees:
+            _dependencies_from_tree(tree, str(pom), collected)
+        return MavenResolution(dependencies=list(collected.values()),
+                               command=command, output=output)
+    finally:
+        # Both paths, always: nothing generated is left in the temp directory,
+        # and nothing is ever written into the scanned project.
+        try:
+            output_file.unlink()
+        except OSError:
+            pass
+
+
+def _maven_log_notes(output: str, limit: int = 40) -> list:
+    """The tail of a Maven log, indented -- only ever shown with --verbose."""
+    lines = [line.rstrip() for line in output.splitlines() if line.strip()]
+    trimmed = lines[-limit:]
+    notes = []
+    if len(lines) > len(trimmed):
+        notes.append(
+            f"  [dim]... {len(lines) - len(trimmed)} earlier Maven lines[/dim]"
+        )
+    notes.extend(f"    [dim]{line}[/dim]" for line in trimmed)
+    return notes
+
+
+def parse_pom(path: Path, options: "ScanOptions | None" = None) -> ParseReport:
+    """
+    Resolve a pom.xml with Maven, falling back to static XML parsing.
+
+    A fallback is never fatal: a Maven-less or currently unresolvable project
+    still gets scanned with whatever the XML alone reveals.
+    """
+    options = options if options is not None else ScanOptions()
+
+    if options.no_maven:
+        report = parse_pom_xml(path)
+        report.notes.append(
+            "  [dim]Maven resolution disabled; using static pom.xml analysis[/dim]"
+        )
+        return report
+
+    command = find_maven_command(path.parent)
+    if command is None:
+        report = parse_pom_xml(path)
+        report.notes.append(f"  [yellow]warning[/yellow] Maven unavailable for {path}")
+        report.notes.append("  [dim]falling back to static POM analysis[/dim]")
+        return report
+
+    notes = [
+        f"  [dim]Maven detected:[/dim] {command.display}",
+        f"  [dim]Resolving[/dim] {path} [dim]with Maven "
+        "(runs the project's own build tooling)...[/dim]",
+    ]
+    resolution = resolve_maven_dependencies(
+        path, command=command, timeout=options.maven_timeout
+    )
+
+    # A wrapper that will not start at all -- the usual cause being a checkout
+    # that lost the executable bit -- says nothing about the project, so the
+    # Maven on PATH still gets its turn before static parsing does.
+    if resolution.error == MavenErrorKind.NOT_FOUND and command.source == "wrapper":
+        fallback_command = maven_on_path()
+        if fallback_command is not None:
+            notes.append(
+                f"  [yellow]warning[/yellow] {command.display} would not start; "
+                f"[dim]trying {fallback_command.display}[/dim]"
+            )
+            resolution = resolve_maven_dependencies(
+                path, command=fallback_command, timeout=options.maven_timeout
+            )
+
+    if not resolution.ok:
+        report = parse_pom_xml(path)
+        report.notes = notes + [
+            "  [yellow]warning[/yellow] Maven dependency resolution failed "
+            f"[dim]({resolution.error})[/dim]",
+            f"  [dim]reason:[/dim] {resolution.reason}",
+            "  [dim]Falling back to static POM analysis...[/dim]",
+        ]
+        if options.verbose and resolution.output:
+            report.notes.extend(_maven_log_notes(resolution.output))
+        report.issues.append(
+            ParseIssue(
+                "maven_resolution_failed",
+                "warning",
+                f"{resolution.error}: {resolution.reason} "
+                "(fell back to static pom.xml analysis)",
+                str(path),
+            )
+        )
+        return report
+
+    report = ParseReport(dependencies=resolution.dependencies, notes=notes)
+    direct = sum(1 for dep in report.dependencies if dep.direct)
+    total = len(report.dependencies)
+    report.detail = [
+        f"     [cyan]{direct}[/cyan] direct dependencies",
+        f"     [cyan]{total - direct}[/cyan] transitive dependencies",
+        f"     [cyan]{total}[/cyan] resolved dependencies",
+    ]
+    return report
 
 def parse_pipfile_lock(path: Path, environment: dict | None = None,
                        resolver: VersionResolver | None = None) -> ParseReport:
@@ -975,6 +1446,9 @@ class ScanOptions:
     environment: dict = field(default_factory=dict)   # PEP 508 marker overrides
     resolver: VersionResolver | None = None
     skip_dev: bool = False
+    verbose: bool = False
+    no_maven: bool = False           # never execute Maven; parse pom.xml only
+    maven_timeout: int = MAVEN_TIMEOUT_SECONDS
 
     def python_parser_kwargs(self) -> dict:
         return {
@@ -984,7 +1458,7 @@ class ScanOptions:
 
 
 FILE_PARSERS = {
-    "pom.xml": parse_pom_xml,
+    "pom.xml": parse_pom,
     "package.json": parse_package_json,
     "requirements.txt": parse_requirements_txt,
     "Pipfile.lock": parse_pipfile_lock,
@@ -1002,9 +1476,12 @@ _ENVIRONMENT_AWARE = {
     parse_pipfile_lock,
 }
 
+# Parsers that shell out to a build tool and need the whole scan options.
+_OPTIONS_AWARE = {parse_pom}
+
 # Patterns tried in order when the exact filename doesn't match.
 FILE_PATTERNS = [
-    (lambda n: n.endswith("pom.xml"),          parse_pom_xml),
+    (lambda n: n.endswith("pom.xml"),          parse_pom),
     (lambda n: n.endswith("package.json"),     parse_package_json),
     (lambda n: n.endswith("requirements.txt"), parse_requirements_txt),
     (lambda n: n == "Pipfile.lock",            parse_pipfile_lock),
@@ -1038,7 +1515,12 @@ def _parser_for_file(path: Path):
 
 
 def _run_parser(parser, path: Path, options: ScanOptions) -> ParseReport:
-    kwargs = options.python_parser_kwargs() if parser in _ENVIRONMENT_AWARE else {}
+    if parser in _ENVIRONMENT_AWARE:
+        kwargs = options.python_parser_kwargs()
+    elif parser in _OPTIONS_AWARE:
+        kwargs = {"options": options}
+    else:
+        kwargs = {}
     try:
         return parser(path, **kwargs)
     except Exception as e:  # a broken manifest must not abort the whole scan
@@ -1047,18 +1529,27 @@ def _run_parser(parser, path: Path, options: ScanOptions) -> ParseReport:
 
 def _dedupe(deps: list) -> list:
     """
-    Collapse identical records.
+    Collapse identical records into one, keeping every source they came from.
 
     The specifier is part of the key so that two unresolved requirements with
-    different constraints are not silently merged into one.
+    different constraints are not silently merged into one.  Where the same
+    resolved package/version does appear in several manifests -- the normal
+    case across the modules of a Maven reactor -- it becomes a single OSV
+    query, and the other manifests are recorded on the surviving record.
     """
-    seen: set = set()
+    first_seen: dict = {}
     unique = []
     for dep in deps:
         key = (dep.ecosystem, dep.name, dep.version, dep.specifier)
-        if key not in seen:
-            seen.add(key)
+        kept = first_seen.get(key)
+        if kept is None:
+            first_seen[key] = dep
             unique.append(dep)
+            continue
+        if dep.source_file not in kept.sources:
+            kept.also_used_by.append(dep.source_file)
+        # Declared anywhere means the package is a direct dependency somewhere.
+        kept.direct = kept.direct or dep.direct
     return unique
 
 
@@ -1071,6 +1562,13 @@ def discover_and_parse(paths: list, skip_dev: bool = False,
 
     def announce(target: Path, sub: ParseReport) -> None:
         if quiet:
+            return
+        for note in sub.notes:
+            console.print(note)
+        if sub.detail:
+            console.print(f"  [green]ok[/green] [bold]{target}[/bold]")
+            for line in sub.detail:
+                console.print(line)
             return
         unresolved = len(sub.unresolved)
         extra = f", [yellow]{unresolved}[/yellow] unresolved" if unresolved else ""
@@ -1505,6 +2003,32 @@ def _print_unresolved(report: ParseReport) -> None:
         "range can be evaluated. Pin them, supply a lockfile, or rerun with "
         "--resolve-from-env.[/dim]"
     )
+    if any(dep.ecosystem == "Maven" for dep in unresolved):
+        console.print(
+            "[dim]The Maven entries above come from static pom.xml analysis. "
+            "Letting Maven resolve the project (the default) supplies the "
+            "versions its parents, BOMs and properties define.[/dim]"
+        )
+
+
+def print_resolved_maven(report: ParseReport) -> None:
+    """List the graph Maven resolved, split into what was declared and what came with it."""
+    resolved = [d for d in report.dependencies if d.resolution == "maven"]
+    if not resolved:
+        return
+    for label, group in (
+        ("DIRECT", [d for d in resolved if d.direct]),
+        ("TRANSITIVE", [d for d in resolved if not d.direct]),
+    ):
+        if not group:
+            continue
+        console.print()
+        console.print(f"[bold]{label}[/bold]")
+        for dep in sorted(group, key=lambda d: (d.name, d.version or "")):
+            scope = f" [dim]({dep.scope})[/dim]" if dep.scope else ""
+            console.print(f"  {dep.name}:{dep.version}{scope}")
+            for extra in dep.also_used_by:
+                console.print(f"    [dim]also used by {extra}[/dim]")
 
 
 def _print_issues(report: ParseReport) -> None:
@@ -1574,6 +2098,13 @@ def print_table_output(report: ParseReport, vuln_map: dict, min_severity: str) -
         f"[red]{len(vulnerable)}[/red] vulnerable package(s)",
         f"[cyan]{resolved}[/cyan] of [cyan]{len(deps)}[/cyan] dependencies matched",
     ]
+    maven = [d for d in deps if d.resolution == "maven"]
+    if maven:
+        direct = sum(1 for d in maven if d.direct)
+        parts.append(
+            f"[cyan]{direct}[/cyan] direct + [cyan]{len(maven) - direct}[/cyan] "
+            "transitive resolved by Maven"
+        )
     if report.unresolved:
         parts.append(f"[yellow]{len(report.unresolved)}[/yellow] indeterminate")
     if report.inactive:
@@ -1595,9 +2126,14 @@ def _dependency_json(dep: Dependency) -> dict:
         "direct_url": dep.direct_url,
         "ecosystem": dep.ecosystem,
         "source": dep.source_file,
+        "sources": dep.sources,
         "line": dep.line,
         "dev": dep.is_dev,
         "active": dep.active,
+        "scope": dep.scope,
+        "direct": dep.direct,
+        "type": dep.artifact_type,
+        "classifier": dep.classifier,
         "vulnerability_match": dep.vulnerability_match,
     }
 
@@ -1689,6 +2225,14 @@ Examples:
   checkdeps --python-version 3.11 --sys-platform linux
                                      evaluate markers for that target
   checkdeps --resolve-from-env       use installed versions where unpinned
+  checkdeps --verbose                show the resolved Maven dependency graph
+  checkdeps --no-maven               never run Maven; parse pom.xml statically
+
+A pom.xml is resolved by running the project's own Maven (the Maven Wrapper
+when there is one, otherwise mvn from PATH) so that versions inherited from
+parents, BOMs and properties, plus transitive dependencies, are all scanned.
+Only the dependency:tree goal is executed -- never package, install, verify or
+test -- and --no-maven turns the execution off entirely.
         """,
     )
     parser.add_argument(
@@ -1747,6 +2291,25 @@ Examples:
         help="Take exact versions from the installed environment when a "
              "requirement does not pin one",
     )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="List the resolved Maven dependency graph and show Maven's own "
+             "output when resolution fails",
+    )
+    parser.add_argument(
+        "--no-maven",
+        action="store_true",
+        help="Never execute Maven; analyse pom.xml statically instead",
+    )
+    parser.add_argument(
+        "--maven-timeout",
+        type=int,
+        default=MAVEN_TIMEOUT_SECONDS,
+        metavar="SECONDS",
+        help=f"Time budget for one Maven resolution "
+             f"(default: {MAVEN_TIMEOUT_SECONDS})",
+    )
 
     args = parser.parse_args()
     scan_paths = [Path(p) for p in (args.paths or ["."])]
@@ -1761,6 +2324,9 @@ Examples:
         resolver=(VersionResolver.from_installed() if args.resolve_from_env
                   else VersionResolver()),
         skip_dev=args.skip_dev,
+        verbose=args.verbose,
+        no_maven=args.no_maven,
+        maven_timeout=args.maven_timeout,
     )
 
     report = discover_and_parse(
@@ -1774,6 +2340,9 @@ Examples:
             console.print("[yellow]No dependencies found to scan.[/yellow]")
             _print_issues(report)
         sys.exit(1 if (args.fail_on_unresolved and report.errors) else 0)
+
+    if args.verbose and not quiet:
+        print_resolved_maven(report)
 
     matchable = sum(1 for d in report.dependencies if d.resolved)
     if not quiet:

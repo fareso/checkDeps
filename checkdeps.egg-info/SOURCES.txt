@@ -8,4 +8,6 @@ checkdeps.egg-info/entry_points.txt
 checkdeps.egg-info/requires.txt
 checkdeps.egg-info/top_level.txt
 tests/test_advisory_matching.py
+tests/test_maven_resolution.py
+tests/test_native_resolution.py
 tests/test_requirements_parser.py

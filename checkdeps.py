@@ -3,19 +3,26 @@
 checkdeps - CVE vulnerability scanner for dependency manifests.
 
 Supported files:
-  pom.xml            Maven (Java)
-  package.json       npm / Node.js
-  requirements.txt   pip (Python)
-  Pipfile / Pipfile.lock   Pipenv
-  pyproject.toml     Poetry / PEP 621
-  Cargo.toml         Cargo (Rust)
-  go.mod             Go modules
+  pom.xml                        Maven (Java)
+  build.gradle[.kts]             Gradle (Java)
+  package.json + lockfiles       npm / Yarn / pnpm (Node.js)
+  requirements.txt               pip (Python)
+  Pipfile / Pipfile.lock         Pipenv (Python)
+  pyproject.toml + uv.lock / poetry.lock   uv / Poetry / PEP 621 (Python)
+  Cargo.toml / Cargo.lock        Cargo (Rust)
+  go.mod                         Go modules
 
-Maven projects are resolved by Maven itself: when a pom.xml is found, the
-project's Maven Wrapper (or mvn from PATH) is asked for the dependency tree, so
-versions inherited from parent POMs, BOMs, dependencyManagement and properties
-are real, and transitive dependencies are scanned too.  Static pom.xml parsing
-remains the fallback for when Maven cannot be run.
+Every ecosystem is resolved by its own tooling wherever that is possible:
+Maven and Gradle (project wrapper first) for Java, the npm/Yarn lockfile or
+pnpm for JavaScript, uv/Poetry/Pipenv lockfiles for Python, Cargo.lock or
+cargo for Rust, and go list for Go.  That means real versions -- inherited,
+BOM-managed, property-driven, conflict-mediated -- and the transitive graph
+that a manifest never names.  Only read-only dependency-inspection commands
+are run: never a build, test, install or package step.
+
+Static manifest parsing remains the fallback, and it is never fatal for a
+tool to be missing: checkdeps says which tool, why it matters, and how to
+install it on the platform it is running on, then scans what it can.
 
 Python dependencies are extracted with a real PEP 508 parser: extras, version
 specifiers and environment markers are kept as separate fields, names are
@@ -108,7 +115,9 @@ class Dependency:
     resolution: str | None = None   # how ``version`` was determined
     active: bool = True             # marker evaluated true for the target env
     raw: str | None = None
-    scope: str | None = None        # Maven scope: compile/runtime/provided/test
+    resolver: str | None = None     # id of the resolver that produced this
+    introduced_by: str | None = None    # the package that pulled this one in
+    scope: str | None = None        # Maven scope / Gradle configuration
     direct: bool = True             # declared by the project, not pulled in
     artifact_type: str | None = None    # Maven <type>, e.g. jar / pom
     classifier: str | None = None       # Maven <classifier>, when present
@@ -173,17 +182,15 @@ class ParseReport:
     inactive: list = field(default_factory=list)      # marker evaluated false
     issues: list = field(default_factory=list)
 
-    # Console lines belonging to one manifest: ``notes`` are printed before its
-    # "ok" line, ``detail`` replaces the usual "(N deps)" suffix underneath it.
-    # Both are consumed by the caller that parsed the file, so merge() -- which
-    # builds the scan-wide report -- deliberately leaves them behind.
-    notes: list = field(default_factory=list)
-    detail: list = field(default_factory=list)
+    # One record per manifest resolved or parsed -- what the presentation
+    # layer renders, and what JSON output serialises.
+    records: list = field(default_factory=list)
 
     def merge(self, other: "ParseReport") -> None:
         self.dependencies.extend(other.dependencies)
         self.inactive.extend(other.inactive)
         self.issues.extend(other.issues)
+        self.records.extend(other.records)
 
     @property
     def errors(self) -> list:
@@ -202,6 +209,403 @@ class Vulnerability:
     cvss_score: object  # float or None
     aliases: list = field(default_factory=list)
     published: str = ""
+
+
+
+
+# ---------------------------------------------------------------------------
+# Platform detection
+# ---------------------------------------------------------------------------
+
+# Telling somebody "mvn not found" is not help.  Telling them the one command
+# that installs Maven on the machine they are actually sitting at is.  That
+# needs three facts: the platform, the package manager present on it, and a
+# maintained mapping from tool to package.  Nothing here ever installs
+# anything -- checkdeps only explains.
+
+
+class Platform:
+    WINDOWS = "windows"
+    MACOS = "macos"
+    LINUX = "linux"
+    OTHER = "other"
+
+
+PLATFORM_NAMES = {
+    Platform.WINDOWS: "Windows",
+    Platform.MACOS: "macOS",
+    Platform.LINUX: "Linux",
+    Platform.OTHER: "this platform",
+}
+
+
+def detect_platform() -> str:
+    if sys.platform == "win32":
+        return Platform.WINDOWS
+    if sys.platform == "darwin":
+        return Platform.MACOS
+    if sys.platform.startswith("linux"):
+        return Platform.LINUX
+    return Platform.OTHER
+
+
+OS_RELEASE_PATH = "/etc/os-release"
+
+
+def read_os_release(path: str = OS_RELEASE_PATH) -> dict:
+    """
+    Parse /etc/os-release into a dict, or return {} if it cannot be read.
+
+    Absent or unreadable means the distribution is unknown, and unknown is
+    reported as unknown -- never guessed at.
+    """
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    values = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        values[key.strip()] = value
+    return values
+
+
+def linux_distribution(path: str = OS_RELEASE_PATH) -> tuple:
+    """Return (id, [id_like...], pretty name) for the running Linux system."""
+    values = read_os_release(path)
+    distro_id = (values.get("ID") or "").strip().lower()
+    like = [item for item in (values.get("ID_LIKE") or "").lower().split() if item]
+    pretty = values.get("PRETTY_NAME") or values.get("NAME") or ""
+    return distro_id, like, pretty
+
+
+# ---------------------------------------------------------------------------
+# Package manager detection
+# ---------------------------------------------------------------------------
+
+# Installer strategy ids.  These are the keys tools register instructions
+# against, so they are part of the registry's contract.
+WINGET = "winget"
+CHOCO = "choco"
+SCOOP = "scoop"
+BREW = "brew"
+APT = "apt"
+DNF = "dnf"
+PACMAN = "pacman"
+ZYPPER = "zypper"
+APK = "apk"
+
+
+@dataclass
+class PackageManager:
+    id: str
+    display_name: str
+    executable: str
+    platform: str
+    distributions: tuple = ()   # Linux ID / ID_LIKE values this belongs to
+
+
+PACKAGE_MANAGERS = [
+    PackageManager(WINGET, "winget", "winget", Platform.WINDOWS),
+    PackageManager(CHOCO, "Chocolatey", "choco", Platform.WINDOWS),
+    PackageManager(SCOOP, "Scoop", "scoop", Platform.WINDOWS),
+    PackageManager(BREW, "Homebrew", "brew", Platform.MACOS),
+    PackageManager(APT, "APT", "apt-get", Platform.LINUX,
+                   ("debian", "ubuntu", "linuxmint", "raspbian", "pop")),
+    PackageManager(DNF, "DNF", "dnf", Platform.LINUX,
+                   ("fedora", "rhel", "centos", "rocky", "almalinux")),
+    PackageManager(PACMAN, "pacman", "pacman", Platform.LINUX,
+                   ("arch", "manjaro", "endeavouros")),
+    PackageManager(ZYPPER, "zypper", "zypper", Platform.LINUX,
+                   ("opensuse", "suse", "sles", "opensuse-leap",
+                    "opensuse-tumbleweed")),
+    PackageManager(APK, "apk", "apk", Platform.LINUX, ("alpine",)),
+]
+
+PACKAGE_MANAGERS_BY_ID = {manager.id: manager for manager in PACKAGE_MANAGERS}
+
+
+def _executable_exists(name: str) -> bool:
+    return shutil.which(name) is not None
+
+
+def detect_package_manager(platform: str | None = None,
+                           os_release_path: str = OS_RELEASE_PATH
+                           ) -> PackageManager | None:
+    """
+    The package manager to give instructions for, or None.
+
+    Only managers that are actually installed are ever returned: recommending
+    ``brew install`` to somebody without Homebrew is the same dead end as
+    recommending nothing.  On Linux the distribution's own manager is
+    preferred, and when the distribution cannot be identified checkdeps does
+    not guess it -- it simply looks at which manager is on PATH.
+    """
+    platform = platform or detect_platform()
+    candidates = [m for m in PACKAGE_MANAGERS if m.platform == platform]
+    if not candidates:
+        return None
+
+    if platform == Platform.LINUX:
+        distro_id, like, _ = linux_distribution(os_release_path)
+        known = [name for name in [distro_id, *like] if name]
+        preferred = [
+            manager for manager in candidates
+            if any(name in manager.distributions for name in known)
+        ]
+        # Distribution-matched managers first, then any other installed one.
+        candidates = preferred + [m for m in candidates if m not in preferred]
+
+    for manager in candidates:
+        if _executable_exists(manager.executable):
+            return manager
+    return None
+
+
+def describe_platform(platform: str | None = None,
+                      os_release_path: str = OS_RELEASE_PATH) -> str:
+    """One line naming the platform, including the distribution when known."""
+    platform = platform or detect_platform()
+    if platform != Platform.LINUX:
+        return PLATFORM_NAMES[platform]
+    _, _, pretty = linux_distribution(os_release_path)
+    return f"Linux: {pretty}" if pretty else "Linux"
+
+
+# ---------------------------------------------------------------------------
+# Tool installation registry
+# ---------------------------------------------------------------------------
+
+# Installation commands are user-facing instructions, so they live in one
+# maintained table rather than being assembled from package names at the call
+# site.  A combination that is not listed here is not guessed at: the tool's
+# own installation page is offered instead.
+
+
+@dataclass
+class ToolDefinition:
+    id: str
+    display_name: str
+    executables: tuple            # PATH commands that mean "installed"
+    purpose: str                  # why checkdeps wants it, in one sentence
+    homepage: str                 # official installation instructions
+    installers: dict = field(default_factory=dict)   # installer id -> command
+    generic_command: str | None = None   # platform-independent, when there is one
+
+    @property
+    def command(self) -> str:
+        return self.executables[0] if self.executables else self.id
+
+
+TOOLS = {
+    "maven": ToolDefinition(
+        id="maven",
+        display_name="Maven",
+        executables=("mvn",),
+        purpose="resolve the exact versions a pom.xml selects, including "
+                "parent-, BOM- and dependencyManagement-supplied versions and "
+                "the whole transitive graph",
+        homepage="https://maven.apache.org/install.html",
+        installers={
+            WINGET: "winget install --id Apache.Maven -e",
+            CHOCO: "choco install maven",
+            SCOOP: "scoop install maven",
+            BREW: "brew install maven",
+            APT: "sudo apt install maven",
+            DNF: "sudo dnf install maven",
+            PACMAN: "sudo pacman -S maven",
+            ZYPPER: "sudo zypper install maven",
+            APK: "sudo apk add maven",
+        },
+    ),
+    "gradle": ToolDefinition(
+        id="gradle",
+        display_name="Gradle",
+        executables=("gradle",),
+        purpose="ask Gradle for the dependency graph it resolves, rather than "
+                "trying to evaluate build scripts statically",
+        homepage="https://gradle.org/install/",
+        installers={
+            WINGET: "winget install --id Gradle.Gradle -e",
+            CHOCO: "choco install gradle",
+            SCOOP: "scoop install gradle",
+            BREW: "brew install gradle",
+            APT: "sudo apt install gradle",
+            DNF: "sudo dnf install gradle",
+            PACMAN: "sudo pacman -S gradle",
+        },
+    ),
+    "npm": ToolDefinition(
+        id="npm",
+        display_name="npm",
+        executables=("npm",),
+        purpose="read the installed dependency tree of a Node.js project",
+        homepage="https://nodejs.org/en/download",
+        installers={
+            WINGET: "winget install --id OpenJS.NodeJS.LTS -e",
+            CHOCO: "choco install nodejs-lts",
+            SCOOP: "scoop install nodejs-lts",
+            BREW: "brew install node",
+            APT: "sudo apt install nodejs npm",
+            DNF: "sudo dnf install nodejs npm",
+            PACMAN: "sudo pacman -S nodejs npm",
+            ZYPPER: "sudo zypper install nodejs npm",
+            APK: "sudo apk add nodejs npm",
+        },
+    ),
+    "pnpm": ToolDefinition(
+        id="pnpm",
+        display_name="pnpm",
+        executables=("pnpm",),
+        purpose="resolve a pnpm workspace, whose pnpm-lock.yaml only pnpm "
+                "itself can interpret reliably",
+        homepage="https://pnpm.io/installation",
+        installers={
+            WINGET: "winget install --id pnpm.pnpm -e",
+            CHOCO: "choco install pnpm",
+            SCOOP: "scoop install pnpm",
+            BREW: "brew install pnpm",
+        },
+        generic_command="npm install -g pnpm",
+    ),
+    "yarn": ToolDefinition(
+        id="yarn",
+        display_name="Yarn",
+        executables=("yarn",),
+        purpose="resolve a Yarn project whose lockfile checkdeps cannot read "
+                "on its own",
+        homepage="https://yarnpkg.com/getting-started/install",
+        installers={
+            WINGET: "winget install --id Yarn.Yarn -e",
+            CHOCO: "choco install yarn",
+            SCOOP: "scoop install yarn",
+            BREW: "brew install yarn",
+        },
+        generic_command="npm install -g yarn",
+    ),
+    "uv": ToolDefinition(
+        id="uv",
+        display_name="uv",
+        executables=("uv",),
+        purpose="produce the uv.lock that pins every version this project "
+                "resolves to",
+        homepage="https://docs.astral.sh/uv/getting-started/installation/",
+        installers={
+            WINGET: "winget install --id astral-sh.uv -e",
+            CHOCO: "choco install uv",
+            SCOOP: "scoop install uv",
+            BREW: "brew install uv",
+        },
+        generic_command="pipx install uv",
+    ),
+    "poetry": ToolDefinition(
+        id="poetry",
+        display_name="Poetry",
+        executables=("poetry",),
+        purpose="produce the poetry.lock that pins every version this project "
+                "resolves to",
+        homepage="https://python-poetry.org/docs/#installation",
+        installers={
+            CHOCO: "choco install poetry",
+            SCOOP: "scoop install poetry",
+            BREW: "brew install poetry",
+        },
+        generic_command="pipx install poetry",
+    ),
+    "pipenv": ToolDefinition(
+        id="pipenv",
+        display_name="Pipenv",
+        executables=("pipenv",),
+        purpose="produce the Pipfile.lock that pins every version this project "
+                "resolves to",
+        homepage="https://pipenv.pypa.io/en/latest/installation.html",
+        installers={
+            BREW: "brew install pipenv",
+            APT: "sudo apt install pipenv",
+            DNF: "sudo dnf install pipenv",
+            PACMAN: "sudo pacman -S python-pipenv",
+        },
+        generic_command="pipx install pipenv",
+    ),
+    "cargo": ToolDefinition(
+        id="cargo",
+        display_name="Cargo",
+        executables=("cargo",),
+        purpose="read the resolved crate graph of a Rust project",
+        homepage="https://www.rust-lang.org/tools/install",
+        installers={
+            WINGET: "winget install --id Rustlang.Rustup -e",
+            CHOCO: "choco install rustup.install",
+            SCOOP: "scoop install rustup",
+            BREW: "brew install rustup",
+            APT: "sudo apt install cargo",
+            DNF: "sudo dnf install cargo",
+            PACMAN: "sudo pacman -S rust",
+        },
+    ),
+    "go": ToolDefinition(
+        id="go",
+        display_name="Go",
+        executables=("go",),
+        purpose="list the module versions Go actually selects, after minimal "
+                "version selection and any replace directives",
+        homepage="https://go.dev/doc/install",
+        installers={
+            WINGET: "winget install --id GoLang.Go -e",
+            CHOCO: "choco install golang",
+            SCOOP: "scoop install go",
+            BREW: "brew install go",
+            APT: "sudo apt install golang-go",
+            DNF: "sudo dnf install golang",
+            PACMAN: "sudo pacman -S go",
+            ZYPPER: "sudo zypper install go",
+            APK: "sudo apk add go",
+        },
+    ),
+}
+
+
+@dataclass
+class InstallAdvice:
+    """How to install one tool here: a command, or honest generic guidance."""
+
+    tool: ToolDefinition
+    platform: str
+    package_manager: PackageManager | None
+    command: str | None            # None when nothing confident can be offered
+    homepage: str
+
+    @property
+    def source(self) -> str:
+        if self.command is None:
+            return "homepage"
+        if self.package_manager and self.tool.installers.get(
+                self.package_manager.id) == self.command:
+            return self.package_manager.id
+        return "generic"
+
+
+def install_advice(tool_id: str, platform: str | None = None,
+                   os_release_path: str = OS_RELEASE_PATH) -> InstallAdvice:
+    """Work out the single best installation instruction for this machine."""
+    tool = TOOLS[tool_id]
+    platform = platform or detect_platform()
+    manager = detect_package_manager(platform, os_release_path)
+
+    command = None
+    if manager is not None:
+        command = tool.installers.get(manager.id)
+    if command is None:
+        # No registered command for this manager -- a platform-independent one
+        # is still better than a guess, and no command at all beats a wrong one.
+        command = tool.generic_command
+    return InstallAdvice(tool, platform, manager, command, tool.homepage)
 
 
 # ---------------------------------------------------------------------------
@@ -762,448 +1166,6 @@ def parse_pom_xml(path: Path) -> ParseReport:
 
 
 
-# ---------------------------------------------------------------------------
-# Maven resolution
-# ---------------------------------------------------------------------------
-
-# Maven -- not the raw pom.xml -- decides which artifacts a project actually
-# uses: parents, dependencyManagement, imported BOMs, ${properties} and
-# conflict mediation all live inside Maven's model.  So checkdeps asks Maven
-# for the resolved graph and keeps the XML parser above as the fallback for
-# when Maven cannot be run.
-
-MAVEN_DEPENDENCY_PLUGIN = "org.apache.maven.plugins:maven-dependency-plugin"
-# Pinned so the JSON output type is guaranteed to exist regardless of which
-# plugin version the project itself would otherwise select.
-MAVEN_DEPENDENCY_PLUGIN_VERSION = "3.8.1"
-MAVEN_TIMEOUT_SECONDS = 300
-
-MAVEN_SCOPES = {"compile", "provided", "runtime", "test", "system", "import"}
-# Scopes checkdeps treats as dev, matching what the static POM parser has
-# always done.  Kept as data so scope filtering can be added later.
-MAVEN_DEV_SCOPES = {"test", "provided"}
-
-
-class MavenErrorKind:
-    """Failure categories -- diagnostics match on these, not on log wording."""
-
-    NOT_FOUND = "MAVEN_NOT_FOUND"
-    TIMEOUT = "MAVEN_TIMEOUT"
-    EXECUTION_FAILED = "MAVEN_EXECUTION_FAILED"
-    DEPENDENCY_RESOLUTION_FAILED = "MAVEN_DEPENDENCY_RESOLUTION_FAILED"
-    OUTPUT_INVALID = "MAVEN_OUTPUT_INVALID"
-    PLUGIN_FAILED = "MAVEN_PLUGIN_FAILED"
-
-
-@dataclass
-class MavenCommand:
-    argv: list           # executable, as an argument list -- never a shell string
-    display: str         # what to show the user
-    source: str          # "wrapper" | "path"
-
-
-@dataclass
-class MavenResolution:
-    dependencies: list = field(default_factory=list)
-    command: MavenCommand | None = None
-    error: str | None = None      # a MavenErrorKind value when it went wrong
-    reason: str | None = None     # one concise line explaining the failure
-    output: str = ""              # captured Maven log, shown only with --verbose
-
-    @property
-    def ok(self) -> bool:
-        return self.error is None
-
-
-def find_maven_command(project_dir: Path) -> MavenCommand | None:
-    """
-    Locate a Maven to run for ``project_dir``, wrapper first.
-
-    The wrapper is the Maven version the project itself pins, so it resolves
-    more reproducibly than whatever happens to be on PATH.  It is searched for
-    up the directory tree because in a multi-module build it lives at the
-    reactor root, not next to every module's pom.xml.
-    """
-    wrappers = ("mvnw.cmd", "mvnw.bat") if os.name == "nt" else ("mvnw",)
-
-    try:
-        directory = project_dir.resolve()
-    except OSError:
-        directory = project_dir
-
-    for parent in [directory, *directory.parents]:
-        for name in wrappers:
-            candidate = parent / name
-            if candidate.is_file():
-                return MavenCommand([str(candidate)], str(candidate), "wrapper")
-
-    return maven_on_path()
-
-
-def maven_on_path() -> MavenCommand | None:
-    # shutil.which honours PATHEXT, so this finds mvn.cmd on Windows too.
-    found = shutil.which("mvn")
-    if found:
-        return MavenCommand([found], found, "path")
-    return None
-
-
-def _maven_command_line(command: MavenCommand, pom: Path, output_file: Path) -> list:
-    argv = [
-        *command.argv,
-        "-B",  # batch mode: no colour codes, no interactive prompts
-        f"{MAVEN_DEPENDENCY_PLUGIN}:{MAVEN_DEPENDENCY_PLUGIN_VERSION}:tree",
-        "-DoutputType=json",
-        f"-DoutputFile={output_file}",
-        # A reactor build writes one tree per module; without this they
-        # overwrite each other and only the last module survives.
-        "-DappendOutput=true",
-    ]
-    if pom.name != "pom.xml":
-        argv += ["-f", str(pom)]
-    return argv
-
-
-def _classify_maven_failure(output: str) -> tuple:
-    """Map a failed Maven run onto (MavenErrorKind, one-line reason)."""
-    lines = [line.strip() for line in output.splitlines() if line.strip()]
-    errors = [line for line in lines if line.startswith(("[ERROR]", "[FATAL]"))]
-
-    def first_matching(*needles) -> str | None:
-        for line in errors or lines:
-            lowered = line.lower()
-            if any(needle in lowered for needle in needles):
-                return re.sub(r"^\[(ERROR|FATAL)\]\s*", "", line).strip(" -")
-        return None
-
-    resolution_hit = first_matching(
-        "could not resolve dependencies",
-        "could not resolve artifact",
-        "could not find artifact",
-        "failure to find",
-        "non-resolvable parent pom",
-        "non-resolvable import pom",
-    )
-    if resolution_hit:
-        return MavenErrorKind.DEPENDENCY_RESOLUTION_FAILED, resolution_hit
-
-    plugin_hit = first_matching("plugin org.apache.maven.plugins", "no plugin found")
-    if plugin_hit:
-        return MavenErrorKind.PLUGIN_FAILED, plugin_hit
-
-    reason = ""
-    for line in errors:
-        reason = re.sub(r"^\[(ERROR|FATAL)\]\s*", "", line).strip()
-        if reason:
-            break
-    return MavenErrorKind.EXECUTION_FAILED, reason or "Maven exited with an error"
-
-
-def _parse_maven_id(raw) -> tuple | None:
-    """
-    Split a Maven coordinate string into its parts, or return None.
-
-    Accepts ``g:a:version``, ``g:a:type:version``, ``g:a:type:version:scope``
-    and ``g:a:type:classifier:version:scope`` -- the shapes plugin versions
-    older than the expanded JSON schema emit as a bare ``id``.
-    """
-    if not isinstance(raw, str):
-        return None
-    parts = [part.strip() for part in raw.split(":")]
-    if len(parts) < 3 or not all(parts[:3]):
-        return None
-    group, artifact = parts[0], parts[1]
-    rest = parts[2:]
-
-    scope = ""
-    # A trailing scope only ever follows a type, so a three-part tail is the
-    # shortest form that can carry one; that keeps a version named "test" safe.
-    if len(rest) >= 3 and rest[-1].lower() in MAVEN_SCOPES:
-        scope = rest.pop().lower()
-
-    version = rest[-1]
-    artifact_type = rest[0] if len(rest) >= 2 else ""
-    classifier = rest[1] if len(rest) >= 3 else ""
-    if not version:
-        return None
-    return group, artifact, version, artifact_type, classifier, scope
-
-
-def _maven_coordinates(node) -> dict | None:
-    """Read one dependency-tree node into plain coordinates, or None."""
-    if not isinstance(node, dict):
-        return None
-    group = str(node.get("groupId") or "").strip()
-    artifact = str(node.get("artifactId") or "").strip()
-    version = str(node.get("version") or "").strip()
-    scope = str(node.get("scope") or "").strip().lower()
-    artifact_type = str(node.get("type") or "").strip()
-    classifier = str(node.get("classifier") or "").strip()
-
-    if not (group and artifact and version):
-        parsed = _parse_maven_id(node.get("id"))
-        if parsed is None:
-            return None
-        group, artifact, version = parsed[0], parsed[1], parsed[2]
-        artifact_type = artifact_type or parsed[3]
-        classifier = classifier or parsed[4]
-        scope = scope or parsed[5]
-
-    return {
-        "groupId": group,
-        "artifactId": artifact,
-        "version": version,
-        "scope": scope if scope in MAVEN_SCOPES else "compile",
-        "type": artifact_type or "jar",
-        "classifier": classifier or None,
-    }
-
-
-def _load_maven_trees(text: str) -> list:
-    """
-    Decode the plugin's JSON output into one tree per Maven module.
-
-    With ``appendOutput`` a reactor build leaves several top-level objects in
-    the file, one after another, which is not a single JSON document.
-    """
-    decoder = json.JSONDecoder()
-    trees: list = []
-    index, length = 0, len(text)
-    while index < length:
-        while index < length and text[index].isspace():
-            index += 1
-        if index >= length:
-            break
-        try:
-            tree, index = decoder.raw_decode(text, index)
-        except ValueError as exc:
-            raise ValueError("Maven dependency tree was not valid JSON") from exc
-        trees.append(tree)
-    if not trees:
-        raise ValueError("Maven produced an empty dependency tree")
-    return trees
-
-
-def _dependencies_from_tree(tree, source: str, into: dict) -> None:
-    """
-    Walk one module's tree, adding its dependencies to ``into``.
-
-    The root node is the module itself and is skipped; its children are the
-    declared (direct) dependencies and everything below them is transitive.
-    Maven reports an artifact once per path that reaches it, so the first
-    record wins -- but reaching it directly later still promotes it.
-    """
-    if not isinstance(tree, dict):
-        return
-
-    def walk(node, direct: bool) -> None:
-        coords = _maven_coordinates(node)
-        if coords is None:
-            return
-        name = "{groupId}:{artifactId}".format(**coords)
-        key = (name, coords["version"], coords["classifier"])
-        existing = into.get(key)
-        if existing is not None:
-            existing.direct = existing.direct or direct
-            if source != existing.source_file and source not in existing.also_used_by:
-                existing.also_used_by.append(source)
-            return
-        into[key] = Dependency(
-            name=name,
-            version=coords["version"],
-            ecosystem="Maven",
-            source_file=source,
-            is_dev=coords["scope"] in MAVEN_DEV_SCOPES,
-            resolution="maven",
-            scope=coords["scope"],
-            direct=direct,
-            artifact_type=coords["type"],
-            classifier=coords["classifier"],
-        )
-        for child in node.get("children") or []:
-            walk(child, False)
-
-    for child in tree.get("children") or []:
-        walk(child, True)
-
-
-def resolve_maven_dependencies(pom: Path, command: MavenCommand | None = None,
-                               timeout: int = MAVEN_TIMEOUT_SECONDS
-                               ) -> MavenResolution:
-    """
-    Ask Maven for the resolved dependency graph of ``pom``.
-
-    Runs a single dependency-inspection goal -- never a lifecycle phase such as
-    package, install, verify or test -- with the pom's own directory as the
-    working directory, so the project's settings.xml, mirrors, credentials and
-    local repository apply exactly as they would to a normal build.
-    """
-    project_dir = pom.parent if str(pom.parent) else Path(".")
-    if command is None:
-        command = find_maven_command(project_dir)
-    if command is None:
-        return MavenResolution(
-            error=MavenErrorKind.NOT_FOUND,
-            reason="no Maven wrapper next to the project and no mvn on PATH",
-        )
-
-    handle, temp_name = tempfile.mkstemp(prefix="checkdeps-maven-", suffix=".json")
-    os.close(handle)
-    output_file = Path(temp_name)
-    try:
-        argv = _maven_command_line(command, pom, output_file)
-        try:
-            process = subprocess.run(
-                argv,
-                cwd=str(project_dir),
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                check=False,
-            )
-        except subprocess.TimeoutExpired:
-            return MavenResolution(
-                command=command,
-                error=MavenErrorKind.TIMEOUT,
-                reason=f"Maven did not finish within {timeout}s",
-            )
-        except OSError as exc:
-            return MavenResolution(
-                command=command,
-                error=MavenErrorKind.NOT_FOUND,
-                reason=f"could not start {command.display}: {exc}",
-            )
-
-        output = (process.stdout or "") + (process.stderr or "")
-        if process.returncode != 0:
-            kind, reason = _classify_maven_failure(output)
-            return MavenResolution(command=command, error=kind, reason=reason,
-                                   output=output)
-
-        try:
-            raw = output_file.read_text(encoding="utf-8")
-        except OSError as exc:
-            return MavenResolution(
-                command=command,
-                error=MavenErrorKind.OUTPUT_INVALID,
-                reason=f"Maven wrote no dependency tree ({exc})",
-                output=output,
-            )
-
-        try:
-            trees = _load_maven_trees(raw)
-        except ValueError as exc:
-            return MavenResolution(
-                command=command,
-                error=MavenErrorKind.OUTPUT_INVALID,
-                reason=str(exc),
-                output=output,
-            )
-
-        collected: dict = {}
-        for tree in trees:
-            _dependencies_from_tree(tree, str(pom), collected)
-        return MavenResolution(dependencies=list(collected.values()),
-                               command=command, output=output)
-    finally:
-        # Both paths, always: nothing generated is left in the temp directory,
-        # and nothing is ever written into the scanned project.
-        try:
-            output_file.unlink()
-        except OSError:
-            pass
-
-
-def _maven_log_notes(output: str, limit: int = 40) -> list:
-    """The tail of a Maven log, indented -- only ever shown with --verbose."""
-    lines = [line.rstrip() for line in output.splitlines() if line.strip()]
-    trimmed = lines[-limit:]
-    notes = []
-    if len(lines) > len(trimmed):
-        notes.append(
-            f"  [dim]... {len(lines) - len(trimmed)} earlier Maven lines[/dim]"
-        )
-    notes.extend(f"    [dim]{line}[/dim]" for line in trimmed)
-    return notes
-
-
-def parse_pom(path: Path, options: "ScanOptions | None" = None) -> ParseReport:
-    """
-    Resolve a pom.xml with Maven, falling back to static XML parsing.
-
-    A fallback is never fatal: a Maven-less or currently unresolvable project
-    still gets scanned with whatever the XML alone reveals.
-    """
-    options = options if options is not None else ScanOptions()
-
-    if options.no_maven:
-        report = parse_pom_xml(path)
-        report.notes.append(
-            "  [dim]Maven resolution disabled; using static pom.xml analysis[/dim]"
-        )
-        return report
-
-    command = find_maven_command(path.parent)
-    if command is None:
-        report = parse_pom_xml(path)
-        report.notes.append(f"  [yellow]warning[/yellow] Maven unavailable for {path}")
-        report.notes.append("  [dim]falling back to static POM analysis[/dim]")
-        return report
-
-    notes = [
-        f"  [dim]Maven detected:[/dim] {command.display}",
-        f"  [dim]Resolving[/dim] {path} [dim]with Maven "
-        "(runs the project's own build tooling)...[/dim]",
-    ]
-    resolution = resolve_maven_dependencies(
-        path, command=command, timeout=options.maven_timeout
-    )
-
-    # A wrapper that will not start at all -- the usual cause being a checkout
-    # that lost the executable bit -- says nothing about the project, so the
-    # Maven on PATH still gets its turn before static parsing does.
-    if resolution.error == MavenErrorKind.NOT_FOUND and command.source == "wrapper":
-        fallback_command = maven_on_path()
-        if fallback_command is not None:
-            notes.append(
-                f"  [yellow]warning[/yellow] {command.display} would not start; "
-                f"[dim]trying {fallback_command.display}[/dim]"
-            )
-            resolution = resolve_maven_dependencies(
-                path, command=fallback_command, timeout=options.maven_timeout
-            )
-
-    if not resolution.ok:
-        report = parse_pom_xml(path)
-        report.notes = notes + [
-            "  [yellow]warning[/yellow] Maven dependency resolution failed "
-            f"[dim]({resolution.error})[/dim]",
-            f"  [dim]reason:[/dim] {resolution.reason}",
-            "  [dim]Falling back to static POM analysis...[/dim]",
-        ]
-        if options.verbose and resolution.output:
-            report.notes.extend(_maven_log_notes(resolution.output))
-        report.issues.append(
-            ParseIssue(
-                "maven_resolution_failed",
-                "warning",
-                f"{resolution.error}: {resolution.reason} "
-                "(fell back to static pom.xml analysis)",
-                str(path),
-            )
-        )
-        return report
-
-    report = ParseReport(dependencies=resolution.dependencies, notes=notes)
-    direct = sum(1 for dep in report.dependencies if dep.direct)
-    total = len(report.dependencies)
-    report.detail = [
-        f"     [cyan]{direct}[/cyan] direct dependencies",
-        f"     [cyan]{total - direct}[/cyan] transitive dependencies",
-        f"     [cyan]{total}[/cyan] resolved dependencies",
-    ]
-    return report
-
 def parse_pipfile_lock(path: Path, environment: dict | None = None,
                        resolver: VersionResolver | None = None) -> ParseReport:
     try:
@@ -1434,21 +1396,1724 @@ def parse_go_mod(path: Path) -> ParseReport:
     return report
 
 
+
+
 # ---------------------------------------------------------------------------
-# File discovery and dispatch
+# Native resolution framework
+# ---------------------------------------------------------------------------
+
+# A manifest states intent; the ecosystem's own tooling states what was
+# actually selected.  Every ecosystem therefore registers a profile with an
+# ordered list of resolvers, and each resolver answers one question: "can you
+# produce the resolved graph for this project right now?"  When none can, the
+# static parser still runs -- an absent tool degrades the answer, it never
+# fails the scan.
+
+
+class ToolErrorKind:
+    """Why a resolver could not produce a graph.  Never collapsed into one."""
+
+    TOOL_NOT_FOUND = "TOOL_NOT_FOUND"
+    TOOL_VERSION_TOO_OLD = "TOOL_VERSION_TOO_OLD"
+    TOOL_EXECUTION_FAILED = "TOOL_EXECUTION_FAILED"
+    RESOLUTION_FAILED = "RESOLUTION_FAILED"
+    OUTPUT_INVALID = "OUTPUT_INVALID"
+    TIMEOUT = "TIMEOUT"
+
+
+DEFAULT_RESOLVER_TIMEOUT = 300     # seconds, per resolver invocation
+
+
+@dataclass
+class MissingTool:
+    """
+    A tool checkdeps wanted and could not use.
+
+    Deliberately data, not a message: resolvers never print.  The presentation
+    layer turns this into platform-aware help, and JSON output serialises the
+    same record.
+    """
+
+    tool_id: str
+    command: str
+    resolver: str
+    project: str
+    required_for: str
+    fallback: str                       # what checkdeps did instead
+    kind: str = ToolErrorKind.TOOL_NOT_FOUND
+    found_version: str | None = None
+    required_version: str | None = None
+    next_step: str | None = None        # a project command to run once installed
+
+    @property
+    def tool(self) -> ToolDefinition:
+        return TOOLS[self.tool_id]
+
+
+@dataclass
+class ToolCommand:
+    argv: list           # executable plus fixed arguments -- never a shell string
+    display: str         # what to show the user
+    source: str          # "wrapper" | "path"
+    version: str | None = None
+
+
+@dataclass
+class Resolution:
+    """The outcome of one resolver attempt."""
+
+    dependencies: list = field(default_factory=list)
+    resolver_id: str = ""
+    resolver_label: str = ""
+    command: ToolCommand | None = None
+    error: str | None = None       # a ToolErrorKind value when it went wrong
+    reason: str | None = None      # one concise line explaining the failure
+    output: str = ""               # captured tool log, shown only with --verbose
+    missing_tool: MissingTool | None = None
+    diagnostics: list = field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        return self.error is None
+
+
+def find_project_wrapper(project_dir: Path, names) -> Path | None:
+    """
+    Look for a project-local wrapper script, searching upwards.
+
+    A wrapper pins the tool version the project itself expects, so it beats
+    whatever is on PATH.  The search walks up because multi-module builds keep
+    one wrapper at the reactor/root project, not beside every module.
+    """
+    if not names:
+        return None
+    try:
+        directory = project_dir.resolve()
+    except OSError:
+        directory = project_dir
+    for parent in [directory, *directory.parents]:
+        for name in names:
+            candidate = parent / name
+            if candidate.is_file():
+                return candidate
+    return None
+
+
+def run_tool(argv: list, cwd: Path, timeout: int,
+             environment: dict | None = None) -> tuple:
+    """
+    Run an external tool safely and classify anything that goes wrong.
+
+    Returns ``(process, error_kind, reason)`` with exactly one of ``process``
+    or ``error_kind`` set.  Arguments are always a list -- never a shell
+    string -- so paths containing spaces need no quoting and nothing the
+    project controls can be interpreted as a command.
+    """
+    child_environment = None
+    if environment:
+        child_environment = {**os.environ, **environment}
+    try:
+        process = subprocess.run(
+            argv,
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=timeout,
+            check=False,
+            env=child_environment,
+        )
+    except subprocess.TimeoutExpired:
+        return None, ToolErrorKind.TIMEOUT, f"no result within {timeout}s"
+    except OSError as exc:
+        # A wrapper that will not start says nothing about the project, so this
+        # is reported as an absent tool rather than a broken project.
+        return None, ToolErrorKind.TOOL_NOT_FOUND, f"could not start {argv[0]}: {exc}"
+    return process, None, None
+
+
+def tool_version(command: ToolCommand, argument: str = "--version",
+                 timeout: int = 60) -> str | None:
+    """The tool's own version string, or None if it will not report one."""
+    process, error, _ = run_tool([*command.argv, argument], Path.cwd(), timeout)
+    if error is not None or process.returncode != 0:
+        return None
+    for line in ((process.stdout or "") + (process.stderr or "")).splitlines():
+        line = line.strip()
+        if line:
+            return line
+    return None
+
+
+def version_at_least(found: str | None, minimum: str) -> bool | None:
+    """
+    Compare two tool version strings, or None when ``found`` is unreadable.
+
+    Unreadable is not "too old": a tool that reports its version in some shape
+    checkdeps does not know still gets its chance to run.
+    """
+    if not found:
+        return None
+    match = re.search(r"(\d+(?:\.\d+)*)", found)
+    if match is None:
+        return None
+    try:
+        return Version(match.group(1)) >= Version(minimum)
+    except InvalidVersion:
+        return None
+
+
+# Diagnostics quote whatever a build tool printed, and build tools print
+# repository URLs.  Anything shaped like a credential is masked before it can
+# reach a terminal, a log or a CI transcript.
+_CREDENTIAL_PATTERNS = [
+    (re.compile(r"(?P<scheme>[a-zA-Z][\w+.-]*://)[^/\s:@]+:[^/\s@]+@"),
+     r"\g<scheme>***:***@"),
+    # No leading \b: a secret is just as secret in -Dpassword=... as on its own.
+    (re.compile(r"(?i)(authorization|token|password|passwd|secret|"
+                r"api[_-]?key)\b(\s*[:=]\s*|\s+)(?:bearer\s+|basic\s+)?\S+"),
+     r"\1\2***"),
+    (re.compile(r"(?i)\bbearer\s+\S+"), "Bearer ***"),
+]
+
+
+def redact_secrets(text: str) -> str:
+    """Mask credentials in anything a tool printed before it is displayed."""
+    for pattern, replacement in _CREDENTIAL_PATTERNS:
+        text = pattern.sub(replacement, text)
+    return text
+
+
+def json_objects(text: str) -> list:
+    """
+    Decode a stream of concatenated JSON objects.
+
+    Several tools emit one object per project/module rather than a single
+    document -- Maven with appendOutput, ``go list -json``, Yarn's NDJSON.
+    """
+    decoder = json.JSONDecoder()
+    objects: list = []
+    index, length = 0, len(text)
+    while index < length:
+        while index < length and text[index].isspace():
+            index += 1
+        if index >= length:
+            break
+        try:
+            obj, index = decoder.raw_decode(text, index)
+        except ValueError as exc:
+            raise ValueError("tool output was not valid JSON") from exc
+        objects.append(obj)
+    if not objects:
+        raise ValueError("tool produced no output to parse")
+    return objects
+
+
+@dataclass
+class ResolutionContext:
+    """Everything a resolver may look at before deciding it can run."""
+
+    profile: "ResolverProfile"
+    project_dir: Path
+    files: dict                       # filename -> Path, for this project only
+    options: "ScanOptions"
+
+    def path(self, name: str) -> Path | None:
+        return self.files.get(name)
+
+    def has(self, *names) -> bool:
+        return any(name in self.files for name in names)
+
+    @property
+    def timeout(self) -> int:
+        return self.options.resolver_timeout
+
+
+class Resolver:
+    """
+    One way to obtain a resolved dependency graph.
+
+    Subclasses implement :meth:`triggers` (is this resolver relevant to the
+    project at hand?) and :meth:`resolve`.  Those that drive an external
+    executable declare ``tool_id`` so a missing one produces installation help
+    instead of a shrug.
+    """
+
+    id = ""
+    label = ""
+    tool_id: str | None = None
+    executables: tuple = ()
+    windows_wrappers: tuple = ()
+    posix_wrappers: tuple = ()
+    minimum_version: str | None = None
+    version_argument = "--version"
+    supersedes: tuple = ()             # manifests this replaces when it succeeds
+    required_for = "the resolved dependency graph"
+    next_step: str | None = None       # command that would make this work
+
+    @property
+    def needs_tool(self) -> bool:
+        return self.tool_id is not None
+
+    def triggers(self, ctx: ResolutionContext) -> bool:
+        raise NotImplementedError
+
+    def priority(self, ctx: ResolutionContext) -> int:
+        """Lower runs first.  Override to honour a project's own choice."""
+        return 0
+
+    def wrapper_names(self) -> tuple:
+        return self.windows_wrappers if os.name == "nt" else self.posix_wrappers
+
+    def find_command(self, ctx: ResolutionContext) -> ToolCommand | None:
+        """The executable to drive, wrapper first, or None if there is none."""
+        wrapper = find_project_wrapper(ctx.project_dir, self.wrapper_names())
+        if wrapper is not None:
+            return ToolCommand([str(wrapper)], str(wrapper), "wrapper")
+        return self.command_on_path()
+
+    def command_on_path(self) -> ToolCommand | None:
+        for executable in self.executables:
+            found = shutil.which(executable)
+            if found:
+                return ToolCommand([found], found, "path")
+        return None
+
+    def describe(self, command: ToolCommand | None) -> str:
+        if command is not None and command.source == "wrapper":
+            return f"{self.label} Wrapper"
+        return self.label
+
+    def missing(self, ctx: ResolutionContext, fallback: str,
+                kind: str = ToolErrorKind.TOOL_NOT_FOUND,
+                found_version: str | None = None) -> MissingTool:
+        return MissingTool(
+            tool_id=self.tool_id,
+            command=TOOLS[self.tool_id].command,
+            resolver=self.id,
+            project=str(ctx.profile.primary_target(ctx)),
+            required_for=self.required_for,
+            fallback=fallback,
+            kind=kind,
+            found_version=found_version,
+            required_version=self.minimum_version,
+            next_step=self.next_step,
+        )
+
+    def resolve(self, ctx: ResolutionContext,
+                command: ToolCommand | None) -> Resolution:
+        raise NotImplementedError
+
+
+class LockfileResolver(Resolver):
+    """A resolver that reads a lockfile the project already contains."""
+
+    lockfiles: tuple = ()
+
+    def triggers(self, ctx: ResolutionContext) -> bool:
+        return ctx.has(*self.lockfiles)
+
+    def find_command(self, ctx: ResolutionContext) -> ToolCommand | None:
+        return None
+
+    def lockfile(self, ctx: ResolutionContext) -> Path | None:
+        for name in self.lockfiles:
+            found = ctx.path(name)
+            if found is not None:
+                return found
+        return None
+
+    def describe(self, command: ToolCommand | None) -> str:
+        return self.label
+
+
+def failed(resolver: Resolver, kind: str, reason: str,
+           command: ToolCommand | None = None, output: str = "") -> Resolution:
+    return Resolution(
+        resolver_id=resolver.id,
+        resolver_label=resolver.describe(command),
+        command=command,
+        error=kind,
+        reason=reason,
+        output=output,
+    )
+
+
+def resolved(resolver: Resolver, dependencies: list,
+             command: ToolCommand | None = None, output: str = "",
+             diagnostics: list | None = None) -> Resolution:
+    return Resolution(
+        dependencies=dependencies,
+        resolver_id=resolver.id,
+        resolver_label=resolver.describe(command),
+        command=command,
+        output=output,
+        diagnostics=diagnostics or [],
+    )
+
+
+
+# ---------------------------------------------------------------------------
+# Maven
+# ---------------------------------------------------------------------------
+
+# Maven -- not the raw pom.xml -- decides which artifacts a project uses:
+# parents, dependencyManagement, imported BOMs, ${properties} and conflict
+# mediation all live inside Maven's model.
+
+MAVEN_DEPENDENCY_PLUGIN = "org.apache.maven.plugins:maven-dependency-plugin"
+# Pinned so the JSON output type is guaranteed to exist regardless of which
+# plugin version the project itself would otherwise select.
+MAVEN_DEPENDENCY_PLUGIN_VERSION = "3.8.1"
+
+MAVEN_SCOPES = {"compile", "provided", "runtime", "test", "system", "import"}
+# Scopes checkdeps treats as dev, matching what the static POM parser does.
+MAVEN_DEV_SCOPES = {"test", "provided"}
+
+
+def _parse_maven_id(raw) -> tuple | None:
+    """
+    Split a Maven coordinate string into its parts, or return None.
+
+    Accepts ``g:a:version``, ``g:a:type:version``, ``g:a:type:version:scope``
+    and ``g:a:type:classifier:version:scope`` -- the shapes plugin versions
+    older than the expanded JSON schema emit as a bare ``id``.
+    """
+    if not isinstance(raw, str):
+        return None
+    parts = [part.strip() for part in raw.split(":")]
+    if len(parts) < 3 or not all(parts[:3]):
+        return None
+    group, artifact = parts[0], parts[1]
+    rest = parts[2:]
+
+    scope = ""
+    # A trailing scope only ever follows a type, so a three-part tail is the
+    # shortest form that can carry one; that keeps a version named "test" safe.
+    if len(rest) >= 3 and rest[-1].lower() in MAVEN_SCOPES:
+        scope = rest.pop().lower()
+
+    version = rest[-1]
+    artifact_type = rest[0] if len(rest) >= 2 else ""
+    classifier = rest[1] if len(rest) >= 3 else ""
+    if not version:
+        return None
+    return group, artifact, version, artifact_type, classifier, scope
+
+
+def _maven_coordinates(node) -> dict | None:
+    """Read one dependency-tree node into plain coordinates, or None."""
+    if not isinstance(node, dict):
+        return None
+    group = str(node.get("groupId") or "").strip()
+    artifact = str(node.get("artifactId") or "").strip()
+    version = str(node.get("version") or "").strip()
+    scope = str(node.get("scope") or "").strip().lower()
+    artifact_type = str(node.get("type") or "").strip()
+    classifier = str(node.get("classifier") or "").strip()
+
+    if not (group and artifact and version):
+        parsed = _parse_maven_id(node.get("id"))
+        if parsed is None:
+            return None
+        group, artifact, version = parsed[0], parsed[1], parsed[2]
+        artifact_type = artifact_type or parsed[3]
+        classifier = classifier or parsed[4]
+        scope = scope or parsed[5]
+
+    return {
+        "groupId": group,
+        "artifactId": artifact,
+        "version": version,
+        "scope": scope if scope in MAVEN_SCOPES else "compile",
+        "type": artifact_type or "jar",
+        "classifier": classifier or None,
+    }
+
+
+def _dependencies_from_tree(tree, source: str, into: dict,
+                            resolver_id: str = "maven") -> None:
+    """
+    Walk one module's tree, adding its dependencies to ``into``.
+
+    The root node is the module itself and is skipped; its children are the
+    declared (direct) dependencies and everything below them is transitive.
+    Maven reports an artifact once per path that reaches it, so the first
+    record wins -- but reaching it directly later still promotes it.
+    """
+    if not isinstance(tree, dict):
+        return
+
+    def walk(node, direct: bool, parent: str | None) -> None:
+        coords = _maven_coordinates(node)
+        if coords is None:
+            return
+        name = "{groupId}:{artifactId}".format(**coords)
+        key = (name, coords["version"], coords["classifier"])
+        existing = into.get(key)
+        if existing is not None:
+            existing.direct = existing.direct or direct
+            if source != existing.source_file and source not in existing.also_used_by:
+                existing.also_used_by.append(source)
+            return
+        into[key] = Dependency(
+            name=name,
+            version=coords["version"],
+            ecosystem="Maven",
+            source_file=source,
+            is_dev=coords["scope"] in MAVEN_DEV_SCOPES,
+            resolution="native",
+            resolver=resolver_id,
+            introduced_by=parent,
+            scope=coords["scope"],
+            direct=direct,
+            artifact_type=coords["type"],
+            classifier=coords["classifier"],
+        )
+        for child in node.get("children") or []:
+            walk(child, False, name)
+
+    for child in tree.get("children") or []:
+        walk(child, True, None)
+
+
+def _classify_maven_failure(output: str) -> tuple:
+    """Map a failed Maven run onto (ToolErrorKind, one-line reason)."""
+    lines = [line.strip() for line in output.splitlines() if line.strip()]
+    errors = [line for line in lines if line.startswith(("[ERROR]", "[FATAL]"))]
+
+    def first_matching(*needles) -> str | None:
+        for line in errors or lines:
+            lowered = line.lower()
+            if any(needle in lowered for needle in needles):
+                return re.sub(r"^\[(ERROR|FATAL)\]\s*", "", line).strip(" -")
+        return None
+
+    resolution_hit = first_matching(
+        "could not resolve dependencies",
+        "could not resolve artifact",
+        "could not find artifact",
+        "failure to find",
+        "non-resolvable parent pom",
+        "non-resolvable import pom",
+    )
+    if resolution_hit:
+        return ToolErrorKind.RESOLUTION_FAILED, resolution_hit
+
+    plugin_hit = first_matching("plugin org.apache.maven.plugins", "no plugin found")
+    if plugin_hit:
+        return ToolErrorKind.TOOL_EXECUTION_FAILED, plugin_hit
+
+    reason = ""
+    for line in errors:
+        reason = re.sub(r"^\[(ERROR|FATAL)\]\s*", "", line).strip()
+        if reason:
+            break
+    return ToolErrorKind.TOOL_EXECUTION_FAILED, reason or "Maven exited with an error"
+
+
+class MavenResolver(Resolver):
+    """
+    Ask Maven for the dependency graph of a pom.xml.
+
+    Runs a single dependency-inspection goal -- never a lifecycle phase such as
+    package, install, verify or test -- with the pom's own directory as the
+    working directory, so the project's settings.xml, mirrors, credentials and
+    local repository apply exactly as they would to a normal build.
+    """
+
+    id = "maven"
+    label = "Maven"
+    tool_id = "maven"
+    executables = ("mvn",)
+    windows_wrappers = ("mvnw.cmd", "mvnw.bat")
+    posix_wrappers = ("mvnw",)
+    supersedes = ("pom.xml",)
+    required_for = "the resolved Maven dependency graph"
+
+    def triggers(self, ctx: ResolutionContext) -> bool:
+        return ctx.has("pom.xml")
+
+    def command_line(self, pom: Path, output_file: Path,
+                     command: ToolCommand) -> list:
+        argv = [
+            *command.argv,
+            "-B",  # batch mode: no colour codes, no interactive prompts
+            f"{MAVEN_DEPENDENCY_PLUGIN}:{MAVEN_DEPENDENCY_PLUGIN_VERSION}:tree",
+            "-DoutputType=json",
+            f"-DoutputFile={output_file}",
+            # A reactor build writes one tree per module; without this they
+            # overwrite each other and only the last module survives.
+            "-DappendOutput=true",
+        ]
+        if pom.name != "pom.xml":
+            argv += ["-f", str(pom)]
+        return argv
+
+    def resolve(self, ctx: ResolutionContext,
+                command: ToolCommand | None) -> Resolution:
+        pom = ctx.path("pom.xml")
+        handle, temp_name = tempfile.mkstemp(prefix="checkdeps-maven-",
+                                             suffix=".json")
+        os.close(handle)
+        output_file = Path(temp_name)
+        try:
+            argv = self.command_line(pom, output_file, command)
+            process, error, reason = run_tool(argv, ctx.project_dir, ctx.timeout)
+            if error is not None:
+                return failed(self, error, reason, command)
+
+            output = (process.stdout or "") + (process.stderr or "")
+            if process.returncode != 0:
+                kind, why = _classify_maven_failure(output)
+                return failed(self, kind, why, command, output)
+
+            try:
+                raw = output_file.read_text(encoding="utf-8")
+            except OSError as exc:
+                return failed(self, ToolErrorKind.OUTPUT_INVALID,
+                              f"Maven wrote no dependency tree ({exc})",
+                              command, output)
+            try:
+                trees = json_objects(raw)
+            except ValueError as exc:
+                return failed(self, ToolErrorKind.OUTPUT_INVALID, str(exc),
+                              command, output)
+
+            collected: dict = {}
+            for tree in trees:
+                _dependencies_from_tree(tree, str(pom), collected, self.id)
+            return resolved(self, list(collected.values()), command, output,
+                            [f"resolution command: {' '.join(argv)}"])
+        finally:
+            # Both paths, always: nothing generated is left in the temp
+            # directory, and nothing is ever written into the scanned project.
+            try:
+                output_file.unlink()
+            except OSError:
+                pass
+
+
+# ---------------------------------------------------------------------------
+# Gradle
+# ---------------------------------------------------------------------------
+
+# Gradle build scripts are programs, so checkdeps does not try to evaluate
+# them: it asks Gradle for the graph it resolves and reads the report.
+
+# Configurations worth scanning.  Anything ending in "Classpath" is what
+# actually reaches the application or its tests; the legacy names cover older
+# builds that never migrated.
+GRADLE_LEGACY_CONFIGURATIONS = {"compile", "runtime", "default"}
+
+GRADLE_COORDINATE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+\-]*$")
+
+# The configurations a static read of build.gradle understands, and whether
+# each one only matters to tests.
+GRADLE_STATIC_CONFIGURATIONS = {
+    "implementation": False,
+    "api": False,
+    "compileOnly": False,
+    "compileOnlyApi": False,
+    "runtimeOnly": False,
+    "developmentOnly": False,
+    "annotationProcessor": False,
+    "kapt": False,
+    "ksp": False,
+    "compile": False,
+    "runtime": False,
+    "testImplementation": True,
+    "testCompileOnly": True,
+    "testRuntimeOnly": True,
+    "testAnnotationProcessor": True,
+    "testCompile": True,
+    "testRuntime": True,
+    "androidTestImplementation": True,
+}
+
+
+def gradle_configuration_is_dev(name: str) -> bool:
+    return name.lower().startswith(("test", "androidtest"))
+
+
+def gradle_configuration_is_scanned(name: str) -> bool:
+    return name.endswith("Classpath") or name in GRADLE_LEGACY_CONFIGURATIONS
+
+
+def _gradle_tree_entry(line: str) -> tuple | None:
+    """
+    Split one line of a Gradle dependency report into (depth, entry).
+
+    The report draws its tree in fixed five-character columns, so depth is
+    counted rather than guessed from leading whitespace.
+    """
+    rest = line.rstrip()
+    depth = 0
+    while True:
+        head = rest[:5]
+        if head in ("|    ", "     "):
+            rest = rest[5:]
+            depth += 1
+            continue
+        if head in ("+--- ", "\\--- "):
+            return depth + 1, rest[5:].strip()
+        return None
+
+
+def _gradle_selected_version(entry: str) -> tuple | None:
+    """
+    Read ``group:artifact:version`` out of one report entry.
+
+    Handles the report's own notations: ``requested -> selected`` for conflict
+    resolution, and the trailing markers for omitted subtrees.  Entries Gradle
+    itself could not resolve are dropped rather than reported at their
+    requested version.
+    """
+    text = entry.strip()
+    unresolved = False
+    while text.endswith((" (*)", " (n)", " (c)", " (+)")):
+        unresolved = unresolved or text.endswith(" (n)")
+        text = text[:-4].rstrip()
+    if not text or text.startswith("project ") or text.startswith("--- "):
+        return None
+    if unresolved:
+        return None
+
+    requested, arrow, selected = text.partition(" -> ")
+    parts = requested.split(":")
+    if len(parts) < 2 or not parts[0] or not parts[1]:
+        return None
+    group, artifact = parts[0].strip(), parts[1].strip()
+    version = selected.strip() if arrow else (parts[2].strip() if len(parts) > 2 else "")
+    if not GRADLE_COORDINATE.match(version or ""):
+        return None
+    return group, artifact, version
+
+
+def parse_gradle_report(text: str, source: str, resolver_id: str) -> list:
+    """Turn a ``gradle dependencies`` report into normalised dependencies."""
+    collected: dict = {}
+    configuration = None
+    stack: dict = {}
+    for line in text.splitlines():
+        entry = _gradle_tree_entry(line)
+        if entry is None:
+            stripped = line.strip()
+            header = re.match(r"^([A-Za-z][A-Za-z0-9_]*)(?: - .*)?$", stripped)
+            if header and not line.startswith(" "):
+                configuration = header.group(1)
+                stack = {}
+            continue
+        if configuration is None or not gradle_configuration_is_scanned(configuration):
+            continue
+
+        depth, body = entry
+        coordinates = _gradle_selected_version(body)
+        if coordinates is None:
+            stack.pop(depth, None)
+            continue
+        group, artifact, version = coordinates
+        name = f"{group}:{artifact}"
+        stack[depth] = name
+        for deeper in [key for key in stack if key > depth]:
+            del stack[deeper]
+
+        is_dev = gradle_configuration_is_dev(configuration)
+        key = (name, version)
+        existing = collected.get(key)
+        if existing is not None:
+            existing.direct = existing.direct or depth == 1
+            existing.is_dev = existing.is_dev and is_dev
+            continue
+        collected[key] = Dependency(
+            name=name,
+            version=version,
+            ecosystem="Maven",
+            source_file=source,
+            is_dev=is_dev,
+            resolution="native",
+            resolver=resolver_id,
+            introduced_by=stack.get(depth - 1),
+            scope=configuration,
+            direct=depth == 1,
+        )
+    return list(collected.values())
+
+
+class GradleResolver(Resolver):
+    """
+    Ask Gradle for its resolved dependency report.
+
+    Only the read-only ``dependencies`` task is run: no build, no tests, no
+    artifacts.  The wrapper is preferred because it pins the Gradle version
+    the build was written for.
+    """
+
+    id = "gradle"
+    label = "Gradle"
+    tool_id = "gradle"
+    executables = ("gradle",)
+    windows_wrappers = ("gradlew.bat",)
+    posix_wrappers = ("gradlew",)
+    supersedes = ("build.gradle", "build.gradle.kts")
+    required_for = "the resolved Gradle dependency graph"
+
+    def triggers(self, ctx: ResolutionContext) -> bool:
+        return ctx.has("build.gradle", "build.gradle.kts")
+
+    def resolve(self, ctx: ResolutionContext,
+                command: ToolCommand | None) -> Resolution:
+        build_file = ctx.path("build.gradle") or ctx.path("build.gradle.kts")
+        argv = [
+            *command.argv,
+            "--console=plain",
+            "--quiet",
+            # No daemon: a scan should not leave a background process behind
+            # on a machine that was not already running Gradle builds.
+            "--no-daemon",
+        ]
+        if ctx.options.offline:
+            argv.append("--offline")
+        argv.append("dependencies")
+        process, error, reason = run_tool(argv, ctx.project_dir, ctx.timeout)
+        if error is not None:
+            return failed(self, error, reason, command)
+
+        output = (process.stdout or "") + (process.stderr or "")
+        if process.returncode != 0:
+            return failed(self, ToolErrorKind.RESOLUTION_FAILED,
+                          _first_error_line(output, "Gradle exited with an error"),
+                          command, output)
+
+        dependencies = parse_gradle_report(process.stdout or "", str(build_file),
+                                           self.id)
+        if not dependencies:
+            # Gradle can report success while every classpath it printed
+            # failed to resolve.  Nothing resolved is not an answer, so the
+            # static reading of the build script gets its turn instead.
+            reason = ("Gradle resolved no dependencies"
+                      + (" (the report contains FAILED entries)"
+                         if "FAILED" in output else ""))
+            return failed(self, ToolErrorKind.RESOLUTION_FAILED, reason,
+                          command, output)
+        return resolved(self, dependencies, command, output,
+                        [f"resolution command: {' '.join(argv)}"])
+
+
+def _first_error_line(output: str, default: str) -> str:
+    """The most useful single line out of a failed tool's output."""
+    lines = [line.strip() for line in output.splitlines() if line.strip()]
+    for line in lines:
+        lowered = line.lower()
+        if lowered.startswith(("error:", "fatal:", "* what went wrong")):
+            return line
+    for index, line in enumerate(lines):
+        if line.lower().startswith("* what went wrong") and index + 1 < len(lines):
+            return lines[index + 1]
+    for line in lines:
+        if "error" in line.lower() or "could not" in line.lower():
+            return line
+    return lines[-1] if lines else default
+
+
+def parse_build_gradle(path: Path) -> ParseReport:
+    """
+    Read declared dependencies out of a Gradle build script.
+
+    A fallback only: build scripts are code, so anything computed at build
+    time -- a version property, a platform BOM, a plugin-managed version --
+    stays unresolved here.  Gradle itself is what resolves those.
+    """
+    try:
+        text = path.read_text(encoding="utf-8-sig")
+    except Exception as exc:
+        return _read_error(path, exc)
+
+    report = ParseReport()
+    seen = set()
+
+    def add(configuration: str, group: str, artifact: str, version, raw: str,
+            lineno: int) -> None:
+        if configuration not in GRADLE_STATIC_CONFIGURATIONS:
+            return
+        name = f"{group}:{artifact}"
+        if (name, version) in seen:
+            return
+        seen.add((name, version))
+        report.dependencies.append(Dependency(
+            name=name,
+            version=version,
+            ecosystem="Maven",
+            source_file=str(path),
+            is_dev=GRADLE_STATIC_CONFIGURATIONS[configuration],
+            specifier=version,
+            resolution="manifest" if version else None,
+            scope=configuration,
+            line=lineno,
+            raw=raw,
+        ))
+
+    string_notation = re.compile(
+        r"""(?P<configuration>[A-Za-z][A-Za-z0-9]*)\s*[(\s]\s*
+            (?P<quote>['"])(?P<coordinate>[^'"]+)(?P=quote)""",
+        re.VERBOSE,
+    )
+    map_notation = re.compile(
+        r"""(?P<configuration>[A-Za-z][A-Za-z0-9]*)\s*[(\s]\s*
+            group:\s*['"](?P<group>[^'"]+)['"]\s*,\s*
+            name:\s*['"](?P<artifact>[^'"]+)['"]
+            (?:\s*,\s*version:\s*['"](?P<version>[^'"]+)['"])?""",
+        re.VERBOSE,
+    )
+
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        line = raw.split("//")[0]
+        match = map_notation.search(line)
+        if match:
+            add(match.group("configuration"), match.group("group"),
+                match.group("artifact"), match.group("version"), raw.strip(), lineno)
+            continue
+        match = string_notation.search(line)
+        if not match:
+            continue
+        parts = match.group("coordinate").split(":")
+        if len(parts) < 2 or "$" in parts[0] or "$" in parts[1]:
+            continue          # an interpolated coordinate names no package
+        version = parts[2].strip() if len(parts) > 2 else None
+        if version and not GRADLE_COORDINATE.match(version):
+            version = None
+        add(match.group("configuration"), parts[0].strip(), parts[1].strip(),
+            version or None, raw.strip(), lineno)
+    return report
+
+
+
+# ---------------------------------------------------------------------------
+# JavaScript / TypeScript
+# ---------------------------------------------------------------------------
+
+# package.json records ranges; the lockfile records what those ranges resolved
+# to, for the whole tree.  npm and Yarn lockfiles are deterministic formats
+# that checkdeps reads directly, so no tool has to be installed.  pnpm's
+# lockfile is pnpm's own business, so pnpm itself is asked.
+
+NPM_DEPENDENCY_SECTIONS = [
+    ("dependencies", False),
+    ("devDependencies", True),
+    ("optionalDependencies", False),
+    ("peerDependencies", False),
+]
+
+
+def read_package_json(path: Path | None) -> dict:
+    if path is None:
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def package_json_declarations(path: Path | None) -> tuple:
+    """Return (direct names, dev-only names) as declared in package.json."""
+    data = read_package_json(path)
+    direct, dev_only = set(), set()
+    for section, is_dev in NPM_DEPENDENCY_SECTIONS:
+        names = data.get(section)
+        if not isinstance(names, dict):
+            continue
+        for name in names:
+            direct.add(name)
+            if is_dev:
+                dev_only.add(name)
+    return direct, dev_only - (direct - dev_only)
+
+
+def declared_package_manager(path: Path | None) -> str | None:
+    """The ``packageManager`` field's tool name, e.g. "pnpm" -- or None."""
+    field_value = read_package_json(path).get("packageManager")
+    if not isinstance(field_value, str) or not field_value.strip():
+        return None
+    return field_value.strip().split("@")[0].lower() or None
+
+
+def _npm_dependency(name: str, version: str, source: str, resolver_id: str,
+                    *, direct: bool, is_dev: bool,
+                    introduced_by: str | None = None) -> Dependency:
+    return Dependency(
+        name=name,
+        version=version,
+        ecosystem="npm",
+        source_file=source,
+        is_dev=is_dev,
+        resolution="native",
+        resolver=resolver_id,
+        introduced_by=introduced_by,
+        direct=direct,
+    )
+
+
+def _merge_dependency(into: dict, dependency: Dependency) -> None:
+    key = (dependency.name, dependency.version)
+    existing = into.get(key)
+    if existing is None:
+        into[key] = dependency
+        return
+    existing.direct = existing.direct or dependency.direct
+    existing.is_dev = existing.is_dev and dependency.is_dev
+
+
+def walk_npm_tree(node: dict, source: str, resolver_id: str, into: dict,
+                  *, direct: bool = True, is_dev: bool = False,
+                  parent: str | None = None, depth: int = 0) -> None:
+    """
+    Walk the nested ``{name: {version, dependencies: {...}}}`` shape.
+
+    ``npm ls --json`` and ``pnpm ls --json`` both produce it, so one walker
+    serves both.  Entries npm marks missing or unmet have no version and are
+    skipped rather than reported at a guessed one.
+    """
+    if not isinstance(node, dict) or depth > 64:
+        return
+    for name, entry in node.items():
+        if not isinstance(entry, dict):
+            continue
+        version = entry.get("version")
+        if not isinstance(version, str) or not version:
+            continue
+        dev = bool(entry.get("dev")) or is_dev
+        _merge_dependency(into, _npm_dependency(
+            name, version, source, resolver_id,
+            direct=direct, is_dev=dev, introduced_by=parent,
+        ))
+        walk_npm_tree(entry.get("dependencies") or {}, source, resolver_id, into,
+                      direct=False, is_dev=dev, parent=name, depth=depth + 1)
+
+
+class NpmLockResolver(LockfileResolver):
+    """Read package-lock.json / npm-shrinkwrap.json, every version pinned."""
+
+    id = "npm-lock"
+    label = "package-lock.json"
+    lockfiles = ("package-lock.json", "npm-shrinkwrap.json")
+    supersedes = ("package.json",)
+
+    def priority(self, ctx: ResolutionContext) -> int:
+        return -1 if declared_package_manager(ctx.path("package.json")) == "npm" else 0
+
+    def resolve(self, ctx: ResolutionContext,
+                command: ToolCommand | None) -> Resolution:
+        lock = self.lockfile(ctx)
+        try:
+            data = json.loads(lock.read_text(encoding="utf-8-sig"))
+        except Exception as exc:
+            return failed(self, ToolErrorKind.OUTPUT_INVALID,
+                          f"could not read {lock.name}: {exc}")
+        if not isinstance(data, dict):
+            return failed(self, ToolErrorKind.OUTPUT_INVALID,
+                          f"{lock.name} is not a lockfile object")
+
+        direct_names, dev_names = package_json_declarations(ctx.path("package.json"))
+        source = str(lock)
+        collected: dict = {}
+
+        packages = data.get("packages")
+        if isinstance(packages, dict) and packages:
+            # Lockfile v2/v3: one flat entry per installed path.
+            root = packages.get("") or {}
+            if isinstance(root, dict):
+                for section, _ in NPM_DEPENDENCY_SECTIONS:
+                    names = root.get(section)
+                    if isinstance(names, dict):
+                        direct_names.update(names)
+            for location, entry in packages.items():
+                if not location or not isinstance(entry, dict):
+                    continue
+                if entry.get("link") or "node_modules/" not in location:
+                    continue          # workspace symlinks are not packages
+                version = entry.get("version")
+                if not isinstance(version, str) or not version:
+                    continue
+                name = location.rsplit("node_modules/", 1)[1]
+                _merge_dependency(collected, _npm_dependency(
+                    name, version, source, self.id,
+                    direct=name in direct_names,
+                    is_dev=bool(entry.get("dev") or entry.get("devOptional"))
+                    or name in dev_names,
+                ))
+        else:
+            # Lockfile v1: a nested tree under "dependencies".
+            walk_npm_tree(data.get("dependencies") or {}, source, self.id,
+                          collected)
+            for dependency in collected.values():
+                dependency.direct = dependency.name in direct_names
+                dependency.is_dev = dependency.is_dev or dependency.name in dev_names
+
+        if not collected:
+            return failed(self, ToolErrorKind.OUTPUT_INVALID,
+                          f"{lock.name} listed no resolved packages")
+        return resolved(self, list(collected.values()))
+
+
+# Yarn's classic and Berry lockfiles are different formats that happen to look
+# alike; the entry key says which protocol an entry uses, and only npm-hosted
+# packages have versions OSV can be asked about.
+YARN_DESCRIPTOR = re.compile(r"^(?P<name>@?[^@\s]+(?:/[^@\s]+)?)@(?P<range>.*)$")
+YARN_NPM_PROTOCOLS = ("npm:", "")
+YARN_SKIPPED_PROTOCOLS = ("workspace:", "patch:", "link:", "portal:", "file:",
+                          "exec:", "git:", "github:", "http:", "https:")
+
+
+def parse_yarn_lock(text: str) -> list:
+    """
+    Read (name, version) pairs out of either Yarn lockfile generation.
+
+    Classic writes ``version "1.2.3"``, Berry writes ``version: 1.2.3``; both
+    key their entries on comma-separated descriptors.  Berry's ``__metadata``
+    block carries a version field of its own and is skipped explicitly.
+    """
+    entries = []
+    descriptors: list = []
+    for raw in text.splitlines():
+        line = raw.rstrip()
+        if not line or line.lstrip().startswith("#"):
+            continue
+        if not line.startswith((" ", "\t")):
+            if not line.endswith(":"):
+                descriptors = []
+                continue
+            descriptors = [
+                part.strip().strip('"').strip("'")
+                for part in line[:-1].split(",")
+            ]
+            continue
+        if not descriptors:
+            continue
+        stripped = line.strip()
+        match = re.match(r'^version:?\s+"?([^"\s]+)"?$', stripped)
+        if not match:
+            continue
+        version = match.group(1)
+        for descriptor in descriptors:
+            if descriptor == "__metadata":
+                continue
+            parsed = YARN_DESCRIPTOR.match(descriptor)
+            if parsed is None:
+                continue
+            protocol = parsed.group("range")
+            if protocol.startswith(YARN_SKIPPED_PROTOCOLS):
+                continue
+            name = parsed.group("name")
+            if name:
+                entries.append((name, version))
+        descriptors = []
+    return entries
+
+
+class YarnLockResolver(LockfileResolver):
+    """Read yarn.lock, classic or Berry."""
+
+    id = "yarn-lock"
+    label = "yarn.lock"
+    lockfiles = ("yarn.lock",)
+    supersedes = ("package.json",)
+
+    def priority(self, ctx: ResolutionContext) -> int:
+        return -1 if declared_package_manager(ctx.path("package.json")) == "yarn" else 0
+
+    def resolve(self, ctx: ResolutionContext,
+                command: ToolCommand | None) -> Resolution:
+        lock = self.lockfile(ctx)
+        try:
+            text = lock.read_text(encoding="utf-8-sig")
+        except OSError as exc:
+            return failed(self, ToolErrorKind.OUTPUT_INVALID,
+                          f"could not read {lock.name}: {exc}")
+
+        direct_names, dev_names = package_json_declarations(ctx.path("package.json"))
+        source = str(lock)
+        collected: dict = {}
+        for name, version in parse_yarn_lock(text):
+            _merge_dependency(collected, _npm_dependency(
+                name, version, source, self.id,
+                direct=name in direct_names,
+                is_dev=name in dev_names,
+            ))
+        if not collected:
+            return failed(self, ToolErrorKind.OUTPUT_INVALID,
+                          "yarn.lock listed no resolved packages")
+        return resolved(self, list(collected.values()))
+
+
+class PnpmResolver(Resolver):
+    """
+    Ask pnpm for the tree it installed.
+
+    pnpm-lock.yaml is pnpm's own format and changes between majors, so pnpm is
+    asked instead of parsed.  ``pnpm ls`` only reads what is on disk -- it
+    installs nothing.
+    """
+
+    id = "pnpm"
+    label = "pnpm"
+    tool_id = "pnpm"
+    executables = ("pnpm",)
+    minimum_version = "7"
+    supersedes = ("package.json",)
+    required_for = "the resolved pnpm dependency graph"
+    next_step = "pnpm install"
+
+    def triggers(self, ctx: ResolutionContext) -> bool:
+        return (ctx.has("pnpm-lock.yaml")
+                or declared_package_manager(ctx.path("package.json")) == "pnpm")
+
+    def priority(self, ctx: ResolutionContext) -> int:
+        return -1 if declared_package_manager(ctx.path("package.json")) == "pnpm" else 0
+
+    def resolve(self, ctx: ResolutionContext,
+                command: ToolCommand | None) -> Resolution:
+        argv = [*command.argv, "ls", "--depth", "Infinity", "--json"]
+        process, error, reason = run_tool(argv, ctx.project_dir, ctx.timeout)
+        if error is not None:
+            return failed(self, error, reason, command)
+        output = (process.stdout or "") + (process.stderr or "")
+        if process.returncode != 0:
+            return failed(self, ToolErrorKind.RESOLUTION_FAILED,
+                          _first_error_line(output, "pnpm exited with an error"),
+                          command, output)
+        try:
+            projects = json.loads(process.stdout or "[]")
+        except ValueError as exc:
+            return failed(self, ToolErrorKind.OUTPUT_INVALID,
+                          f"pnpm did not return JSON ({exc})", command, output)
+
+        source = str(ctx.path("package.json") or ctx.path("pnpm-lock.yaml"))
+        collected: dict = {}
+        for project in projects if isinstance(projects, list) else [projects]:
+            if not isinstance(project, dict):
+                continue
+            for section, is_dev in NPM_DEPENDENCY_SECTIONS:
+                walk_npm_tree(project.get(section) or {}, source, self.id,
+                              collected, is_dev=is_dev)
+        if not collected:
+            return failed(
+                self, ToolErrorKind.RESOLUTION_FAILED,
+                "pnpm reported no installed packages -- run 'pnpm install' first",
+                command, output,
+            )
+        return resolved(self, list(collected.values()), command, output,
+                        [f"resolution command: {' '.join(argv)}"])
+
+
+class NpmTreeResolver(Resolver):
+    """
+    Ask npm for the tree it installed.
+
+    Only useful once ``npm install`` has run, so it sits behind the lockfile
+    resolvers, which need nothing on disk but the lockfile itself.
+    """
+
+    id = "npm"
+    label = "npm"
+    tool_id = "npm"
+    executables = ("npm",)
+    supersedes = ("package.json",)
+    required_for = "the installed npm dependency tree"
+    next_step = "npm install"
+
+    def triggers(self, ctx: ResolutionContext) -> bool:
+        return (ctx.project_dir / "node_modules").is_dir()
+
+    def resolve(self, ctx: ResolutionContext,
+                command: ToolCommand | None) -> Resolution:
+        argv = [*command.argv, "ls", "--all", "--json"]
+        process, error, reason = run_tool(argv, ctx.project_dir, ctx.timeout)
+        if error is not None:
+            return failed(self, error, reason, command)
+        output = (process.stdout or "") + (process.stderr or "")
+        try:
+            # npm exits non-zero for peer/extraneous complaints while still
+            # printing a complete tree, so the JSON is read before judging.
+            data = json.loads(process.stdout or "")
+        except ValueError:
+            return failed(self, ToolErrorKind.RESOLUTION_FAILED,
+                          _first_error_line(output, "npm exited with an error"),
+                          command, output)
+
+        source = str(ctx.path("package.json"))
+        collected: dict = {}
+        walk_npm_tree(data.get("dependencies") or {}, source, self.id, collected)
+        if not collected:
+            return failed(self, ToolErrorKind.RESOLUTION_FAILED,
+                          "npm reported no installed packages", command, output)
+        return resolved(self, list(collected.values()), command, output,
+                        [f"resolution command: {' '.join(argv)}"])
+
+
+
+# ---------------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------------
+
+# Python's resolvers write their answer down: uv.lock, poetry.lock and
+# Pipfile.lock each pin the exact version of every package in the graph,
+# transitive ones included.  Reading them beats running anything -- it needs
+# no tool installed, touches no environment, and installs nothing, which is
+# the one thing a scanner must never do to the project it is scanning.
+
+
+def _load_toml(path: Path):
+    import tomllib
+    return tomllib.loads(path.read_text(encoding="utf-8-sig"))
+
+
+def _python_dependency(name: str, version: str, source: str, resolver_id: str,
+                       *, direct: bool, is_dev: bool) -> Dependency:
+    return Dependency(
+        name=canonicalize_name(name),
+        version=version,
+        ecosystem="PyPI",
+        source_file=source,
+        is_dev=is_dev,
+        resolution="lockfile",
+        resolver=resolver_id,
+        direct=direct,
+    )
+
+
+def _names_from(value) -> set:
+    """Collect package names from the several shapes lock tables use."""
+    names = set()
+    if isinstance(value, list):
+        for item in value:
+            if isinstance(item, str):
+                names.add(canonicalize_name(item))
+            elif isinstance(item, dict) and isinstance(item.get("name"), str):
+                names.add(canonicalize_name(item["name"]))
+    elif isinstance(value, dict):
+        for key, nested in value.items():
+            if key in ("dependencies", "extras"):
+                names |= _names_from(nested)
+            elif isinstance(nested, (list, dict)):
+                names |= _names_from(nested)
+            elif isinstance(key, str):
+                names.add(canonicalize_name(key))
+    return names
+
+
+class UvLockResolver(LockfileResolver):
+    """Read uv.lock: every package uv selected, with its exact version."""
+
+    id = "uv-lock"
+    label = "uv.lock"
+    lockfiles = ("uv.lock",)
+    supersedes = ("pyproject.toml",)
+
+    def resolve(self, ctx: ResolutionContext,
+                command: ToolCommand | None) -> Resolution:
+        lock = self.lockfile(ctx)
+        try:
+            data = _load_toml(lock)
+        except Exception as exc:
+            return failed(self, ToolErrorKind.OUTPUT_INVALID,
+                          f"could not read uv.lock: {exc}")
+
+        packages = data.get("package")
+        if not isinstance(packages, list) or not packages:
+            return failed(self, ToolErrorKind.OUTPUT_INVALID,
+                          "uv.lock listed no packages")
+
+        direct, dev = set(), set()
+        roots = set()
+        for package in packages:
+            if not isinstance(package, dict):
+                continue
+            source = package.get("source")
+            # The project itself is locked as a package with a local source.
+            if isinstance(source, dict) and ({"virtual", "editable"} & set(source)):
+                roots.add(canonicalize_name(str(package.get("name") or "")))
+                direct |= _names_from(package.get("dependencies"))
+                direct |= _names_from(package.get("optional-dependencies"))
+                dev |= _names_from(package.get("dev-dependencies"))
+
+        collected = []
+        for package in packages:
+            if not isinstance(package, dict):
+                continue
+            name = str(package.get("name") or "")
+            version = str(package.get("version") or "")
+            if not name or not version:
+                continue
+            canonical = canonicalize_name(name)
+            if canonical in roots:
+                continue
+            collected.append(_python_dependency(
+                name, version, str(lock), self.id,
+                direct=canonical in direct or canonical in dev,
+                is_dev=canonical in dev and canonical not in direct,
+            ))
+        if not collected:
+            return failed(self, ToolErrorKind.OUTPUT_INVALID,
+                          "uv.lock contained no resolved packages")
+        return resolved(self, collected)
+
+
+def poetry_declarations(pyproject: Path | None) -> tuple:
+    """Direct and dev-only package names declared for Poetry."""
+    if pyproject is None:
+        return set(), set()
+    try:
+        data = _load_toml(pyproject)
+    except Exception:
+        return set(), set()
+    poetry = ((data.get("tool") or {}).get("poetry") or {})
+    direct = {
+        canonicalize_name(name)
+        for name in (poetry.get("dependencies") or {})
+        if name.lower() != "python"
+    }
+    dev = _names_from(poetry.get("dev-dependencies") or {})
+    for group in (poetry.get("group") or {}).values():
+        if isinstance(group, dict):
+            dev |= {
+                canonicalize_name(name)
+                for name in (group.get("dependencies") or {})
+                if name.lower() != "python"
+            }
+    return direct, dev - direct
+
+
+class PoetryLockResolver(LockfileResolver):
+    """Read poetry.lock: the graph Poetry resolved, pinned."""
+
+    id = "poetry-lock"
+    label = "poetry.lock"
+    lockfiles = ("poetry.lock",)
+    supersedes = ("pyproject.toml",)
+
+    def resolve(self, ctx: ResolutionContext,
+                command: ToolCommand | None) -> Resolution:
+        lock = self.lockfile(ctx)
+        try:
+            data = _load_toml(lock)
+        except Exception as exc:
+            return failed(self, ToolErrorKind.OUTPUT_INVALID,
+                          f"could not read poetry.lock: {exc}")
+        packages = data.get("package")
+        if not isinstance(packages, list) or not packages:
+            return failed(self, ToolErrorKind.OUTPUT_INVALID,
+                          "poetry.lock listed no packages")
+
+        direct, dev = poetry_declarations(ctx.path("pyproject.toml"))
+        collected = []
+        for package in packages:
+            if not isinstance(package, dict):
+                continue
+            name = str(package.get("name") or "")
+            version = str(package.get("version") or "")
+            if not name or not version:
+                continue
+            canonical = canonicalize_name(name)
+            # Poetry <1.5 recorded the group on the package itself.
+            category = str(package.get("category") or "").lower()
+            collected.append(_python_dependency(
+                name, version, str(lock), self.id,
+                direct=canonical in direct or canonical in dev,
+                is_dev=canonical in dev or category == "dev",
+            ))
+        if not collected:
+            return failed(self, ToolErrorKind.OUTPUT_INVALID,
+                          "poetry.lock contained no resolved packages")
+        return resolved(self, collected)
+
+
+class PipenvLockResolver(LockfileResolver):
+    """Read Pipfile.lock, marker evaluation and all."""
+
+    id = "pipenv-lock"
+    label = "Pipfile.lock"
+    lockfiles = ("Pipfile.lock",)
+    supersedes = ("Pipfile", "Pipfile.lock")
+
+    def resolve(self, ctx: ResolutionContext,
+                command: ToolCommand | None) -> Resolution:
+        lock = self.lockfile(ctx)
+        report = parse_pipfile_lock(lock, **ctx.options.python_parser_kwargs())
+        if report.errors:
+            return failed(self, ToolErrorKind.OUTPUT_INVALID,
+                          report.errors[0].message)
+        direct = set()
+        pipfile = ctx.path("Pipfile")
+        if pipfile is not None:
+            try:
+                data = _load_toml(pipfile)
+                direct = _names_from(data.get("packages") or {}) | _names_from(
+                    data.get("dev-packages") or {})
+            except Exception:
+                direct = set()
+        for dependency in report.dependencies:
+            dependency.resolver = self.id
+            dependency.direct = not direct or dependency.name in direct
+        outcome = resolved(self, report.dependencies)
+        outcome.diagnostics = [f"{len(report.inactive)} skipped by marker"]
+        return outcome
+
+
+class PythonLockAdvice:
+    """
+    Which Python manager a project uses, and whether its lock is present.
+
+    Used to explain, when nothing could be resolved, exactly which tool would
+    close the gap -- and to offer installation help when that tool is missing
+    too.
+    """
+
+    MANAGERS = [
+        ("uv", "uv.lock", "uv lock"),
+        ("poetry", "poetry.lock", "poetry lock"),
+        ("pipenv", "Pipfile.lock", "pipenv lock"),
+    ]
+
+    @staticmethod
+    def declared(ctx: "ResolutionContext") -> list:
+        declared = []
+        pyproject = ctx.path("pyproject.toml")
+        tables = {}
+        if pyproject is not None:
+            try:
+                tables = _load_toml(pyproject)
+            except Exception:
+                tables = {}
+        tool_tables = tables.get("tool") or {}
+        backend = str(((tables.get("build-system") or {}).get("build-backend")
+                       or "")).lower()
+
+        if "uv" in tool_tables or ctx.has("uv.lock"):
+            declared.append("uv")
+        if "poetry" in tool_tables or "poetry" in backend or ctx.has("poetry.lock"):
+            declared.append("poetry")
+        if ctx.has("Pipfile", "Pipfile.lock"):
+            declared.append("pipenv")
+        return declared
+
+
+# ---------------------------------------------------------------------------
+# Rust
+# ---------------------------------------------------------------------------
+
+
+class CargoLockResolver(LockfileResolver):
+    """Read Cargo.lock: the exact crate graph Cargo resolved."""
+
+    id = "cargo-lock"
+    label = "Cargo.lock"
+    lockfiles = ("Cargo.lock",)
+    supersedes = ("Cargo.toml",)
+
+    def resolve(self, ctx: ResolutionContext,
+                command: ToolCommand | None) -> Resolution:
+        lock = self.lockfile(ctx)
+        try:
+            data = _load_toml(lock)
+        except Exception as exc:
+            return failed(self, ToolErrorKind.OUTPUT_INVALID,
+                          f"could not read Cargo.lock: {exc}")
+        packages = data.get("package")
+        if not isinstance(packages, list) or not packages:
+            return failed(self, ToolErrorKind.OUTPUT_INVALID,
+                          "Cargo.lock listed no packages")
+
+        manifest = ctx.path("Cargo.toml")
+        root_name, direct, dev = "", set(), set()
+        if manifest is not None:
+            try:
+                toml = _load_toml(manifest)
+                root_name = str((toml.get("package") or {}).get("name") or "")
+                direct = set(toml.get("dependencies") or {}) | set(
+                    toml.get("build-dependencies") or {})
+                dev = set(toml.get("dev-dependencies") or {})
+            except Exception:
+                pass
+
+        collected = []
+        for package in packages:
+            if not isinstance(package, dict):
+                continue
+            name = str(package.get("name") or "")
+            version = str(package.get("version") or "")
+            if not name or not version or name == root_name:
+                continue
+            collected.append(Dependency(
+                name=name,
+                version=version,
+                ecosystem="crates.io",
+                source_file=str(lock),
+                is_dev=name in dev and name not in direct,
+                resolution="lockfile",
+                resolver=self.id,
+                direct=name in direct or name in dev,
+            ))
+        if not collected:
+            return failed(self, ToolErrorKind.OUTPUT_INVALID,
+                          "Cargo.lock contained no resolved crates")
+        return resolved(self, collected)
+
+
+class CargoMetadataResolver(Resolver):
+    """Ask Cargo for the resolved crate graph when there is no Cargo.lock."""
+
+    id = "cargo"
+    label = "cargo metadata"
+    tool_id = "cargo"
+    executables = ("cargo",)
+    supersedes = ("Cargo.toml",)
+    required_for = "the resolved Rust crate graph"
+
+    def triggers(self, ctx: ResolutionContext) -> bool:
+        return ctx.has("Cargo.toml")
+
+    def resolve(self, ctx: ResolutionContext,
+                command: ToolCommand | None) -> Resolution:
+        argv = [*command.argv, "metadata", "--format-version", "1"]
+        if ctx.options.offline:
+            argv.append("--offline")
+        process, error, reason = run_tool(argv, ctx.project_dir, ctx.timeout)
+        if error is not None:
+            return failed(self, error, reason, command)
+        output = (process.stdout or "") + (process.stderr or "")
+        if process.returncode != 0:
+            return failed(self, ToolErrorKind.RESOLUTION_FAILED,
+                          _first_error_line(output, "cargo exited with an error"),
+                          command, output)
+        try:
+            data = json.loads(process.stdout or "")
+        except ValueError as exc:
+            return failed(self, ToolErrorKind.OUTPUT_INVALID,
+                          f"cargo did not return JSON ({exc})", command, output)
+
+        workspace = set(data.get("workspace_members") or [])
+        resolve_graph = data.get("resolve") or {}
+        root = resolve_graph.get("root")
+        direct = set()
+        for node in resolve_graph.get("nodes") or []:
+            if isinstance(node, dict) and node.get("id") == root:
+                for dep in node.get("deps") or []:
+                    if isinstance(dep, dict) and isinstance(dep.get("name"), str):
+                        direct.add(dep["name"].replace("_", "-"))
+
+        source = str(ctx.path("Cargo.toml"))
+        collected = []
+        for package in data.get("packages") or []:
+            if not isinstance(package, dict):
+                continue
+            name = str(package.get("name") or "")
+            version = str(package.get("version") or "")
+            if not name or not version or package.get("id") in workspace:
+                continue
+            collected.append(Dependency(
+                name=name, version=version, ecosystem="crates.io",
+                source_file=source, resolution="native", resolver=self.id,
+                direct=name.replace("_", "-") in direct,
+            ))
+        if not collected:
+            return failed(self, ToolErrorKind.RESOLUTION_FAILED,
+                          "cargo reported no packages", command, output)
+        return resolved(self, collected, command, output,
+                        [f"resolution command: {' '.join(argv)}"])
+
+
+# ---------------------------------------------------------------------------
+# Go
+# ---------------------------------------------------------------------------
+
+
+class GoListResolver(Resolver):
+    """
+    Ask the Go toolchain which module versions it selects.
+
+    go.mod records requirements; minimal version selection and any ``replace``
+    directive decide what is actually built, and only Go knows the outcome.
+    """
+
+    id = "go"
+    label = "go list"
+    tool_id = "go"
+    executables = ("go",)
+    supersedes = ("go.mod",)
+    required_for = "the module versions Go selects"
+
+    def triggers(self, ctx: ResolutionContext) -> bool:
+        return ctx.has("go.mod")
+
+    def resolve(self, ctx: ResolutionContext,
+                command: ToolCommand | None) -> Resolution:
+        argv = [*command.argv, "list", "-m", "-json", "all"]
+        # Go has no offline flag: refusing the proxy is what confines it to
+        # the module cache already on disk.
+        environment = {"GOPROXY": "off"} if ctx.options.offline else None
+        process, error, reason = run_tool(argv, ctx.project_dir, ctx.timeout,
+                                          environment)
+        if error is not None:
+            return failed(self, error, reason, command)
+        output = (process.stdout or "") + (process.stderr or "")
+        if process.returncode != 0:
+            return failed(self, ToolErrorKind.RESOLUTION_FAILED,
+                          _first_error_line(output, "go exited with an error"),
+                          command, output)
+        try:
+            modules = json_objects(process.stdout or "")
+        except ValueError as exc:
+            return failed(self, ToolErrorKind.OUTPUT_INVALID, str(exc),
+                          command, output)
+
+        source = str(ctx.path("go.mod"))
+        collected = []
+        for module in modules:
+            if not isinstance(module, dict) or module.get("Main"):
+                continue
+            direct = not module.get("Indirect")
+            replacement = module.get("Replace")
+            if isinstance(replacement, dict):
+                module = replacement
+            path = str(module.get("Path") or "")
+            version = str(module.get("Version") or "")
+            if not path or not version:
+                continue          # a filesystem replacement has no version
+            collected.append(Dependency(
+                name=path,
+                version=version.removeprefix("v"),
+                ecosystem="Go",
+                source_file=source,
+                resolution="native",
+                resolver=self.id,
+                direct=direct,
+            ))
+        if not collected:
+            return failed(self, ToolErrorKind.RESOLUTION_FAILED,
+                          "go listed no modules", command, output)
+        return resolved(self, collected, command, output,
+                        [f"resolution command: {' '.join(argv)}"])
+
+
+# ---------------------------------------------------------------------------
+# Ecosystem registry and discovery
 # ---------------------------------------------------------------------------
 
 
 @dataclass
 class ScanOptions:
-    """Everything the parsers need to know about the scan target."""
+    """Everything the parsers and resolvers need to know about the scan."""
 
     environment: dict = field(default_factory=dict)   # PEP 508 marker overrides
     resolver: VersionResolver | None = None
     skip_dev: bool = False
     verbose: bool = False
-    no_maven: bool = False           # never execute Maven; parse pom.xml only
-    maven_timeout: int = MAVEN_TIMEOUT_SECONDS
+    no_native: bool = False          # never run project tooling; parse only
+    offline: bool = False            # ask resolvers not to reach the network
+    require_native: bool = False     # a missing resolver tool fails the scan
+    resolver_timeout: int = DEFAULT_RESOLVER_TIMEOUT
+    rerun_hint: str = "checkdeps ."  # shown in installation help
 
     def python_parser_kwargs(self) -> dict:
         return {
@@ -1457,15 +3122,318 @@ class ScanOptions:
         }
 
 
+@dataclass
+class ScanRecord:
+    """What happened to one manifest, ready for any presentation layer."""
+
+    ecosystem: str
+    target: str
+    resolver: str
+    native: bool = False
+    total: int = 0
+    direct: int = 0
+    transitive: int = 0
+    indeterminate: int = 0
+    warnings: list = field(default_factory=list)
+    missing_tool: MissingTool | None = None
+    diagnostics: list = field(default_factory=list)
+
+
+@dataclass
+class ResolverProfile:
+    """
+    Everything checkdeps knows about one ecosystem.
+
+    Adding an ecosystem means adding a profile -- discovery, resolution,
+    fallback and the OSV mapping all read from here, and the scanning layer
+    below never learns a new name.
+    """
+
+    ecosystem: str                  # label shown to the user
+    osv_ecosystem: str              # the name OSV knows it by
+    manifests: tuple                # declaration files, in preference order
+    lockfiles: tuple                # resolved-state files
+    resolvers: tuple                # ordered candidates, most authoritative first
+    static_parsers: dict            # filename -> parser, the always-available path
+    advisor: object = None          # optional hook adding guidance to a record
+
+    @property
+    def detection(self) -> tuple:
+        return tuple(self.manifests) + tuple(self.lockfiles)
+
+    @property
+    def static_parser(self):
+        """The parser for this profile's primary manifest."""
+        return self.static_parsers.get(self.manifests[0]) if self.manifests else None
+
+    def files_in(self, project_dir: Path) -> dict:
+        found = {}
+        for name in self.detection:
+            candidate = project_dir / name
+            if candidate.exists():
+                found[name] = candidate
+        return found
+
+    def primary_target(self, ctx: "ResolutionContext") -> Path:
+        for name in self.detection:
+            if name in ctx.files:
+                return ctx.files[name]
+        return ctx.project_dir
+
+    def fallback_description(self, ctx: "ResolutionContext") -> str:
+        names = [name for name in self.manifests if name in ctx.files]
+        if not names:
+            return "no static analysis is possible for this project"
+        return "static {} analysis".format(" and ".join(names))
+
+    def candidates(self, ctx: "ResolutionContext") -> list:
+        applicable = [r for r in self.resolvers if r.triggers(ctx)]
+        # A project that names its package manager gets that one first.
+        return sorted(applicable, key=lambda resolver: resolver.priority(ctx))
+
+    def resolve(self, ctx: "ResolutionContext", record: ScanRecord):
+        """Try each candidate resolver in turn; None when none could run."""
+        fallback = self.fallback_description(ctx)
+        for resolver in self.candidates(ctx):
+            command = None
+            if resolver.needs_tool:
+                command = resolver.find_command(ctx)
+                if command is None:
+                    tool = TOOLS[resolver.tool_id]
+                    record.warnings.append(f"{tool.command} not found")
+                    if record.missing_tool is None:
+                        record.missing_tool = resolver.missing(ctx, fallback)
+                    continue
+                if resolver.minimum_version or ctx.options.verbose:
+                    command.version = tool_version(command, resolver.version_argument)
+                if resolver.minimum_version:
+                    if version_at_least(command.version,
+                                        resolver.minimum_version) is False:
+                        tool = TOOLS[resolver.tool_id]
+                        record.warnings.append(
+                            f"{tool.display_name} {command.version} is older than "
+                            f"the {resolver.minimum_version} this resolver needs"
+                        )
+                        if record.missing_tool is None:
+                            record.missing_tool = resolver.missing(
+                                ctx, fallback, ToolErrorKind.TOOL_VERSION_TOO_OLD,
+                                command.version,
+                            )
+                        continue
+                record.diagnostics.append(
+                    f"{resolver.describe(command)}: {command.display}"
+                    + (f" ({command.version})" if command.version else "")
+                )
+
+            outcome = resolver.resolve(ctx, command)
+            record.diagnostics.extend(outcome.diagnostics)
+            if outcome.ok:
+                return outcome
+            record.warnings.append(
+                f"{resolver.describe(command)} could not resolve "
+                f"({outcome.error}): {outcome.reason}"
+            )
+            if outcome.output and ctx.options.verbose:
+                record.diagnostics.extend(_log_tail(outcome.output))
+        return None
+
+    def scan(self, ctx: "ResolutionContext") -> tuple:
+        """Resolve or parse one project, returning (report, records)."""
+        report = ParseReport()
+        records: list = []
+        outcome = None
+        pending = ScanRecord(self.ecosystem, str(self.primary_target(ctx)), "")
+
+        if self.resolvers and not ctx.options.no_native:
+            outcome = self.resolve(ctx, pending)
+
+        superseded: set = set()
+        if outcome is not None:
+            winner = next((resolver for resolver in self.resolvers
+                           if resolver.id == outcome.resolver_id), None)
+            superseded = set(winner.supersedes) if winner is not None else set()
+            report.dependencies.extend(outcome.dependencies)
+            pending.resolver = outcome.resolver_label
+            pending.native = True
+            _fill_counts(pending, outcome.dependencies)
+            records.append(pending)
+            pending = None
+
+        for name in self.manifests:
+            path = ctx.files.get(name)
+            if path is None or name in superseded:
+                continue
+            parser = self.static_parsers.get(name)
+            if parser is None:
+                continue
+            sub = _run_parser(parser, path, ctx.options)
+            record = pending or ScanRecord(self.ecosystem, str(path), "")
+            record.target = str(path)
+            record.resolver = f"static {name} analysis"
+            record.native = False
+            _fill_counts(record, sub.dependencies)
+            report.merge(sub)
+            records.append(record)
+            pending = None
+
+        # The registry owns the OSV mapping, so nothing downstream has to
+        # learn a new ecosystem name -- and no resolver can drift from it.
+        for dependency in report.dependencies:
+            dependency.ecosystem = self.osv_ecosystem
+        for dependency in report.inactive:
+            dependency.ecosystem = self.osv_ecosystem
+
+        if self.advisor is not None:
+            self.advisor(ctx, records[0] if records else pending)
+
+        if pending is not None:          # nothing to parse, but something to say
+            pending.resolver = "no analysis available"
+            records.append(pending)
+
+        if ctx.options.require_native and self.candidates(ctx) and outcome is None:
+            target = str(self.primary_target(ctx))
+            report.issues.append(ParseIssue(
+                "native_resolution_required", "error",
+                f"{self.ecosystem}: native resolution was required but no "
+                "resolver could run", target,
+            ))
+        return report, records
+
+
+def _fill_counts(record: ScanRecord, dependencies: list) -> None:
+    record.total = len(dependencies)
+    record.direct = sum(1 for dep in dependencies if dep.direct)
+    record.transitive = record.total - record.direct
+    record.indeterminate = sum(1 for dep in dependencies if not dep.resolved)
+
+
+def _log_tail(output: str, limit: int = 40) -> list:
+    """The tail of a tool's log -- only ever shown with --verbose."""
+    lines = [redact_secrets(line.rstrip())
+             for line in output.splitlines() if line.strip()]
+    trimmed = lines[-limit:]
+    notes = []
+    if len(lines) > len(trimmed):
+        notes.append(f"... {len(lines) - len(trimmed)} earlier lines")
+    notes.extend(trimmed)
+    return notes
+
+
+def python_lock_advisor(ctx: "ResolutionContext", record: ScanRecord) -> None:
+    """
+    Explain the one thing that would let checkdeps resolve this project.
+
+    Ranges in a pyproject.toml name no version.  The project's own manager can
+    write down which versions it picks -- so say which manager, whether it is
+    installed, and what to run.  checkdeps never runs it: locking a project is
+    the developer's decision, not a scanner's.
+    """
+    if record is None or record.native:
+        return
+    for manager in PythonLockAdvice.declared(ctx):
+        lockfile, command = {
+            "uv": ("uv.lock", "uv lock"),
+            "poetry": ("poetry.lock", "poetry lock"),
+            "pipenv": ("Pipfile.lock", "pipenv lock"),
+        }[manager]
+        if ctx.has(lockfile):
+            continue                      # present but unreadable: already warned
+        tool = TOOLS[manager]
+        if shutil.which(tool.command) is None:
+            record.warnings.append(
+                f"{tool.display_name} is not installed and there is no {lockfile}"
+            )
+            if record.missing_tool is None:
+                record.missing_tool = MissingTool(
+                    tool_id=manager,
+                    command=tool.command,
+                    resolver=f"{manager}-lock",
+                    project=str(ctx.profile.primary_target(ctx)),
+                    required_for="exact versions for this Python project",
+                    fallback=ctx.profile.fallback_description(ctx),
+                    next_step=command,
+                )
+        else:
+            record.warnings.append(
+                f"no {lockfile} -- run '{command}' so checkdeps can read exact "
+                "versions"
+            )
+        return
+
+
+PROFILES = [
+    ResolverProfile(
+        ecosystem="Maven",
+        osv_ecosystem="Maven",
+        manifests=("pom.xml",),
+        lockfiles=(),
+        resolvers=(MavenResolver(),),
+        static_parsers={"pom.xml": parse_pom_xml},
+    ),
+    ResolverProfile(
+        ecosystem="Gradle",
+        osv_ecosystem="Maven",
+        manifests=("build.gradle", "build.gradle.kts"),
+        lockfiles=(),
+        resolvers=(GradleResolver(),),
+        static_parsers={
+            "build.gradle": parse_build_gradle,
+            "build.gradle.kts": parse_build_gradle,
+        },
+    ),
+    ResolverProfile(
+        ecosystem="npm",
+        osv_ecosystem="npm",
+        manifests=("package.json",),
+        lockfiles=("package-lock.json", "npm-shrinkwrap.json", "pnpm-lock.yaml",
+                   "yarn.lock"),
+        resolvers=(PnpmResolver(), NpmLockResolver(), YarnLockResolver(),
+                   NpmTreeResolver()),
+        static_parsers={"package.json": parse_package_json},
+    ),
+    ResolverProfile(
+        ecosystem="Python",
+        osv_ecosystem="PyPI",
+        manifests=("requirements.txt", "pyproject.toml", "Pipfile"),
+        lockfiles=("uv.lock", "poetry.lock", "Pipfile.lock"),
+        resolvers=(UvLockResolver(), PoetryLockResolver(), PipenvLockResolver()),
+        static_parsers={
+            "requirements.txt": parse_requirements_txt,
+            "pyproject.toml": parse_pyproject_toml,
+            "Pipfile": parse_pipfile,
+        },
+        advisor=python_lock_advisor,
+    ),
+    ResolverProfile(
+        ecosystem="Rust",
+        osv_ecosystem="crates.io",
+        manifests=("Cargo.toml",),
+        lockfiles=("Cargo.lock",),
+        resolvers=(CargoLockResolver(), CargoMetadataResolver()),
+        static_parsers={"Cargo.toml": parse_cargo_toml},
+    ),
+    ResolverProfile(
+        ecosystem="Go",
+        osv_ecosystem="Go",
+        manifests=("go.mod",),
+        lockfiles=(),
+        resolvers=(GoListResolver(),),
+        static_parsers={"go.mod": parse_go_mod},
+    ),
+]
+
+PROFILES_BY_ECOSYSTEM = {profile.ecosystem: profile for profile in PROFILES}
+
+# Derived from the registry so a new ecosystem needs no second list.
 FILE_PARSERS = {
-    "pom.xml": parse_pom,
-    "package.json": parse_package_json,
-    "requirements.txt": parse_requirements_txt,
-    "Pipfile.lock": parse_pipfile_lock,
-    "Pipfile": parse_pipfile,
-    "pyproject.toml": parse_pyproject_toml,
-    "Cargo.toml": parse_cargo_toml,
-    "go.mod": parse_go_mod,
+    name: parser
+    for profile in PROFILES
+    for name, parser in profile.static_parsers.items()
+}
+DETECTION_ORDER = [name for profile in PROFILES for name in profile.detection]
+
+PROFILE_FOR_FILE = {
+    name: profile for profile in PROFILES for name in profile.detection
 }
 
 # Parsers that accept the scan target environment and the version resolver.
@@ -1476,14 +3444,13 @@ _ENVIRONMENT_AWARE = {
     parse_pipfile_lock,
 }
 
-# Parsers that shell out to a build tool and need the whole scan options.
-_OPTIONS_AWARE = {parse_pom}
-
-# Patterns tried in order when the exact filename doesn't match.
+# Patterns tried when a named file is not one of the exact manifest names.
 FILE_PATTERNS = [
-    (lambda n: n.endswith("pom.xml"),          parse_pom),
+    (lambda n: n.endswith("pom.xml"),          parse_pom_xml),
     (lambda n: n.endswith("package.json"),     parse_package_json),
     (lambda n: n.endswith("requirements.txt"), parse_requirements_txt),
+    (lambda n: n.endswith(".gradle") or n.endswith(".gradle.kts"),
+     parse_build_gradle),
     (lambda n: n == "Pipfile.lock",            parse_pipfile_lock),
     (lambda n: n == "Pipfile",                 parse_pipfile),
     (lambda n: n.endswith("pyproject.toml"),   parse_pyproject_toml),
@@ -1491,20 +3458,9 @@ FILE_PATTERNS = [
     (lambda n: n == "go.mod",                  parse_go_mod),
 ]
 
-DETECTION_ORDER = [
-    "pom.xml",
-    "package.json",
-    "requirements.txt",
-    "Pipfile.lock",
-    "Pipfile",
-    "pyproject.toml",
-    "Cargo.toml",
-    "go.mod",
-]
-
 
 def _parser_for_file(path: Path):
-    """Return the appropriate parser for a file, or None if unsupported."""
+    """Return the appropriate static parser for a file, or None."""
     name = path.name
     if name in FILE_PARSERS:
         return FILE_PARSERS[name]
@@ -1515,12 +3471,7 @@ def _parser_for_file(path: Path):
 
 
 def _run_parser(parser, path: Path, options: ScanOptions) -> ParseReport:
-    if parser in _ENVIRONMENT_AWARE:
-        kwargs = options.python_parser_kwargs()
-    elif parser in _OPTIONS_AWARE:
-        kwargs = {"options": options}
-    else:
-        kwargs = {}
+    kwargs = options.python_parser_kwargs() if parser in _ENVIRONMENT_AWARE else {}
     try:
         return parser(path, **kwargs)
     except Exception as e:  # a broken manifest must not abort the whole scan
@@ -1534,8 +3485,8 @@ def _dedupe(deps: list) -> list:
     The specifier is part of the key so that two unresolved requirements with
     different constraints are not silently merged into one.  Where the same
     resolved package/version does appear in several manifests -- the normal
-    case across the modules of a Maven reactor -- it becomes a single OSV
-    query, and the other manifests are recorded on the surviving record.
+    case across the modules of one build -- it becomes a single OSV query, and
+    the other manifests are recorded on the surviving record.
     """
     first_seen: dict = {}
     unique = []
@@ -1553,6 +3504,51 @@ def _dedupe(deps: list) -> list:
     return unique
 
 
+def resolution_context(profile: ResolverProfile, project_dir: Path,
+                       options: ScanOptions | None = None) -> ResolutionContext:
+    """Build the context a resolver sees for one project directory."""
+    options = options if options is not None else ScanOptions()
+    return ResolutionContext(profile, project_dir,
+                             profile.files_in(project_dir), options)
+
+
+def scan_project(project_dir: Path, options: ScanOptions,
+                 profiles=None) -> tuple:
+    """Run every applicable ecosystem profile over one directory."""
+    report = ParseReport()
+    for profile in profiles or PROFILES:
+        files = profile.files_in(project_dir)
+        if not files:
+            continue
+        ctx = ResolutionContext(profile, project_dir, files, options)
+        sub, records = profile.scan(ctx)
+        report.merge(sub)
+        report.records.extend(records)
+    return report
+
+
+def scan_named_file(path: Path, options: ScanOptions) -> ParseReport:
+    """
+    Scan one file the user named explicitly.
+
+    A named manifest still gets its ecosystem's native resolution: pointing at
+    backend/pom.xml should mean the same thing as pointing at backend/.
+    """
+    profile = PROFILE_FOR_FILE.get(path.name)
+    if profile is not None:
+        return scan_project(path.parent if str(path.parent) else Path("."),
+                            options, profiles=[profile])
+
+    parser = _parser_for_file(path)
+    if parser is None:
+        return None
+    sub = _run_parser(parser, path, options)
+    record = ScanRecord("Other", str(path), f"static {path.name} analysis")
+    _fill_counts(record, sub.dependencies)
+    sub.records.append(record)
+    return sub
+
+
 def discover_and_parse(paths: list, skip_dev: bool = False,
                        options: ScanOptions | None = None,
                        quiet: bool = False) -> ParseReport:
@@ -1560,46 +3556,29 @@ def discover_and_parse(paths: list, skip_dev: bool = False,
     options.skip_dev = skip_dev or options.skip_dev
     report = ParseReport()
 
-    def announce(target: Path, sub: ParseReport) -> None:
-        if quiet:
-            return
-        for note in sub.notes:
-            console.print(note)
-        if sub.detail:
-            console.print(f"  [green]ok[/green] [bold]{target}[/bold]")
-            for line in sub.detail:
-                console.print(line)
-            return
-        unresolved = len(sub.unresolved)
-        extra = f", [yellow]{unresolved}[/yellow] unresolved" if unresolved else ""
-        console.print(
-            f"  [green]ok[/green] [bold]{target}[/bold]  "
-            f"([cyan]{len(sub.dependencies)}[/cyan] deps{extra})"
-        )
+    def emit(sub: ParseReport) -> None:
+        report.merge(sub)
+        if not quiet:
+            for record in sub.records:
+                print_scan_record(record, options)
 
     for p in paths:
         if p.is_dir():
-            found_any = False
-            for filename in DETECTION_ORDER:
-                candidate = p / filename
-                if candidate.exists():
-                    found_any = True
-                    sub = _run_parser(FILE_PARSERS[filename], candidate, options)
-                    announce(candidate, sub)
-                    report.merge(sub)
-            if not found_any and not quiet:
-                console.print(
-                    f"[yellow]Warning:[/yellow] No supported manifest found in {p}"
-                )
+            sub = scan_project(p, options)
+            if not sub.records:
+                if not quiet:
+                    console.print(
+                        f"[yellow]Warning:[/yellow] No supported manifest found in {p}"
+                    )
+                continue
+            emit(sub)
         elif p.is_file():
-            parser = _parser_for_file(p)
-            if parser is None:
+            sub = scan_named_file(p, options)
+            if sub is None:
                 if not quiet:
                     console.print(f"[yellow]Warning:[/yellow] Unsupported file: {p}")
-            else:
-                sub = _run_parser(parser, p, options)
-                announce(p, sub)
-                report.merge(sub)
+                continue
+            emit(sub)
         else:
             report.issues.append(
                 ParseIssue("parse_error", "error", f"Path not found: {p}", str(p))
@@ -1612,7 +3591,7 @@ def discover_and_parse(paths: list, skip_dev: bool = False,
         report.dependencies = [d for d in report.dependencies if not d.is_dev]
         skipped = before - len(report.dependencies)
         if skipped and not quiet:
-            console.print(f"  [dim]Skipped {skipped} dev dependencies[/dim]")
+            console.print(f"\n  [dim]Skipped {skipped} dev dependencies[/dim]")
 
     report.dependencies = _dedupe(report.dependencies)
     report.inactive = _dedupe(report.inactive)
@@ -2003,32 +3982,165 @@ def _print_unresolved(report: ParseReport) -> None:
         "range can be evaluated. Pin them, supply a lockfile, or rerun with "
         "--resolve-from-env.[/dim]"
     )
-    if any(dep.ecosystem == "Maven" for dep in unresolved):
+    if any(dep.resolver is None for dep in unresolved):
         console.print(
-            "[dim]The Maven entries above come from static pom.xml analysis. "
-            "Letting Maven resolve the project (the default) supplies the "
-            "versions its parents, BOMs and properties define.[/dim]"
+            "[dim]These came from static manifest analysis. Letting the "
+            "project's own tooling resolve it -- the default, when that "
+            "tooling is installed -- supplies the versions it selects.[/dim]"
         )
 
 
-def print_resolved_maven(report: ParseReport) -> None:
-    """List the graph Maven resolved, split into what was declared and what came with it."""
-    resolved = [d for d in report.dependencies if d.resolution == "maven"]
-    if not resolved:
+def missing_tool_lines(missing: MissingTool, rerun: str = "checkdeps .",
+                       platform: str | None = None,
+                       os_release_path: str = OS_RELEASE_PATH) -> list:
+    """
+    The help text for a tool checkdeps could not use.
+
+    Plain lines, no console: resolvers produce the fact, this produces the
+    words, and tests can read them without a terminal.  Everything the user
+    needs is here -- what is missing, why it mattered, what platform they are
+    on, the one command that installs it, and what checkdeps did instead.
+    """
+    tool = missing.tool
+    advice = install_advice(tool.id, platform, os_release_path)
+    lines = []
+
+    if missing.kind == ToolErrorKind.TOOL_VERSION_TOO_OLD:
+        found = missing.found_version or "the installed version"
+        lines.append(
+            f"{tool.display_name} {found} is older than the "
+            f"{missing.required_version} this resolver needs."
+        )
+    else:
+        lines.append(f"{tool.display_name} is not installed.")
+    lines.append("")
+    lines.append(f"checkdeps uses {tool.display_name} ({tool.command}) to "
+                 f"{tool.purpose}.")
+    lines.append("")
+
+    platform_name = describe_platform(advice.platform, os_release_path)
+    if advice.package_manager is not None:
+        lines.append(f"{platform_name} detected, "
+                     f"{advice.package_manager.display_name} detected.")
+    else:
+        lines.append(f"{platform_name} detected, but no supported package "
+                     "manager was found.")
+    lines.append("")
+
+    verb = "Upgrade" if missing.kind == ToolErrorKind.TOOL_VERSION_TOO_OLD \
+        else "Install"
+    if advice.command:
+        lines.append(f"{verb} {tool.display_name}:")
+        lines.append(f"  {advice.command}")
+    else:
+        # Nothing confident to offer: the official instructions beat a guess.
+        lines.append(f"{verb} {tool.display_name} with your preferred package "
+                     "manager, or follow:")
+        lines.append(f"  {advice.homepage}")
+    lines.append("")
+
+    if missing.next_step:
+        lines.append("Then run, in the project:")
+        lines.append(f"  {missing.next_step}")
+        lines.append("")
+
+    lines.append("Then rerun:")
+    lines.append(f"  {rerun}")
+    lines.append("")
+    lines.append(f"Continuing with {missing.fallback}.")
+    lines.append("Some dependency versions may remain indeterminate.")
+    return lines
+
+
+def missing_tool_json(missing: MissingTool, platform: str | None = None,
+                      os_release_path: str = OS_RELEASE_PATH) -> dict:
+    """The same fact, structured, for --format json and other consumers."""
+    advice = install_advice(missing.tool_id, platform, os_release_path)
+    return {
+        "type": "missing_tool",
+        "tool": missing.tool_id,
+        "displayName": missing.tool.display_name,
+        "command": missing.command,
+        "kind": missing.kind,
+        "resolver": missing.resolver,
+        "project": missing.project,
+        "requiredFor": missing.required_for,
+        "foundVersion": missing.found_version,
+        "requiredVersion": missing.required_version,
+        "platform": advice.platform,
+        "packageManager": (advice.package_manager.id
+                           if advice.package_manager else None),
+        "installer": advice.source,
+        "installCommand": advice.command,
+        "nextStep": missing.next_step,
+        "homepage": advice.homepage,
+        "fallback": missing.fallback,
+        "fallbackUsed": True,
+    }
+
+
+def print_missing_tool(missing: MissingTool, options: "ScanOptions") -> None:
+    console.print()
+    for line in missing_tool_lines(missing, options.rerun_hint):
+        console.print(f"    [yellow]{line}[/yellow]" if line and
+                      line.endswith(("installed.", "needs.")) else f"    {line}",
+                      highlight=False)
+
+
+def _plural(count: int, singular: str, plural: str | None = None) -> str:
+    return singular if count == 1 else (plural or singular + "s")
+
+
+def print_scan_record(record: ScanRecord, options: "ScanOptions") -> None:
+    """One block per manifest: what it is, how it was read, what came out."""
+    console.print()
+    console.print(f"  [bold]{record.ecosystem}[/bold]: {record.target}")
+    for warning in record.warnings:
+        console.print(f"    [yellow]warning[/yellow] {warning}")
+    console.print(f"    [dim]resolver:[/dim] {record.resolver}")
+
+    noun = _plural(record.total, "dependency", "dependencies")
+    if record.native:
+        console.print(
+            f"    [cyan]{record.total}[/cyan] resolved {noun} "
+            f"[dim]({record.direct} direct, {record.transitive} transitive)[/dim]"
+        )
+    else:
+        line = f"    [cyan]{record.total}[/cyan] declared {noun}"
+        if record.indeterminate:
+            line += (f", [yellow]{record.indeterminate}[/yellow] "
+                     f"{_plural(record.indeterminate, 'version')} indeterminate")
+        console.print(line)
+
+    if record.missing_tool is not None:
+        print_missing_tool(record.missing_tool, options)
+    if options.verbose:
+        for line in record.diagnostics:
+            console.print(f"    [dim]{redact_secrets(line)}[/dim]", highlight=False)
+
+
+def print_resolved_dependencies(report: ParseReport) -> None:
+    """List what native resolution produced, declared packages first."""
+    resolved_deps = [d for d in report.dependencies if d.resolver]
+    if not resolved_deps:
         return
     for label, group in (
-        ("DIRECT", [d for d in resolved if d.direct]),
-        ("TRANSITIVE", [d for d in resolved if not d.direct]),
+        ("DIRECT", [d for d in resolved_deps if d.direct]),
+        ("TRANSITIVE", [d for d in resolved_deps if not d.direct]),
     ):
         if not group:
             continue
         console.print()
         console.print(f"[bold]{label}[/bold]")
-        for dep in sorted(group, key=lambda d: (d.name, d.version or "")):
+        for dep in sorted(group, key=lambda d: (d.ecosystem, d.name, d.version or "")):
             scope = f" [dim]({dep.scope})[/dim]" if dep.scope else ""
-            console.print(f"  {dep.name}:{dep.version}{scope}")
+            console.print(f"  {dep.name}:{dep.version}{scope}", highlight=False)
+            if dep.introduced_by:
+                console.print(f"    [dim]via {dep.introduced_by}[/dim]",
+                              highlight=False)
             for extra in dep.also_used_by:
-                console.print(f"    [dim]also used by {extra}[/dim]")
+                console.print(f"    [dim]also used by {extra}[/dim]",
+                              highlight=False)
 
 
 def _print_issues(report: ParseReport) -> None:
@@ -2098,12 +4210,12 @@ def print_table_output(report: ParseReport, vuln_map: dict, min_severity: str) -
         f"[red]{len(vulnerable)}[/red] vulnerable package(s)",
         f"[cyan]{resolved}[/cyan] of [cyan]{len(deps)}[/cyan] dependencies matched",
     ]
-    maven = [d for d in deps if d.resolution == "maven"]
-    if maven:
-        direct = sum(1 for d in maven if d.direct)
+    native = [d for d in deps if d.resolver]
+    if native:
+        direct = sum(1 for d in native if d.direct)
         parts.append(
-            f"[cyan]{direct}[/cyan] direct + [cyan]{len(maven) - direct}[/cyan] "
-            "transitive resolved by Maven"
+            f"[cyan]{direct}[/cyan] direct + [cyan]{len(native) - direct}[/cyan] "
+            "transitive natively resolved"
         )
     if report.unresolved:
         parts.append(f"[yellow]{len(report.unresolved)}[/yellow] indeterminate")
@@ -2132,6 +4244,8 @@ def _dependency_json(dep: Dependency) -> dict:
         "active": dep.active,
         "scope": dep.scope,
         "direct": dep.direct,
+        "resolver": dep.resolver,
+        "introduced_by": dep.introduced_by,
         "type": dep.artifact_type,
         "classifier": dep.classifier,
         "vulnerability_match": dep.vulnerability_match,
@@ -2162,8 +4276,27 @@ def print_json_output(report: ParseReport, vuln_map: dict,
         ]
         findings.append(record)
 
+    missing_tools = [
+        missing_tool_json(record.missing_tool)
+        for record in report.records if record.missing_tool is not None
+    ]
     output = {
         "scanned": len(deps),
+        "resolution": [
+            {
+                "ecosystem": record.ecosystem,
+                "source": record.target,
+                "resolver": record.resolver,
+                "native": record.native,
+                "dependencies": record.total,
+                "direct": record.direct,
+                "transitive": record.transitive,
+                "indeterminate": record.indeterminate,
+                "warnings": record.warnings,
+            }
+            for record in report.records
+        ],
+        "missing_tools": missing_tools,
         "findings": findings,
         "unresolved": [_dependency_json(d) for d in report.unresolved],
         "skipped": [_dependency_json(d) for d in report.inactive],
@@ -2225,14 +4358,16 @@ Examples:
   checkdeps --python-version 3.11 --sys-platform linux
                                      evaluate markers for that target
   checkdeps --resolve-from-env       use installed versions where unpinned
-  checkdeps --verbose                show the resolved Maven dependency graph
-  checkdeps --no-maven               never run Maven; parse pom.xml statically
+  checkdeps --verbose                show the resolved dependency graph
+  checkdeps --no-native              never run build tooling; parse statically
 
-A pom.xml is resolved by running the project's own Maven (the Maven Wrapper
-when there is one, otherwise mvn from PATH) so that versions inherited from
-parents, BOMs and properties, plus transitive dependencies, are all scanned.
-Only the dependency:tree goal is executed -- never package, install, verify or
-test -- and --no-maven turns the execution off entirely.
+Each ecosystem is resolved by its own tooling where that is possible: Maven or
+Gradle (wrapper first) for Java, the npm/Yarn lockfile or pnpm for JavaScript,
+uv/poetry/Pipfile locks for Python, Cargo.lock or cargo for Rust and go list
+for Go.  Only read-only dependency-inspection commands are ever run -- never a
+build, test, install or package step -- and --no-native turns execution off.
+When a tool is missing, checkdeps explains how to install it on this platform
+and continues with static manifest analysis.
         """,
     )
     parser.add_argument(
@@ -2294,21 +4429,37 @@ test -- and --no-maven turns the execution off entirely.
     parser.add_argument(
         "--verbose",
         action="store_true",
-        help="List the resolved Maven dependency graph and show Maven's own "
-             "output when resolution fails",
+        help="List the resolved dependency graph, the resolver and tool used, "
+             "and the tool's own output when resolution fails",
     )
     parser.add_argument(
+        "--no-native",
         "--no-maven",
+        dest="no_native",
         action="store_true",
-        help="Never execute Maven; analyse pom.xml statically instead",
+        help="Never execute project build tooling; analyse manifests statically",
     )
     parser.add_argument(
+        "--offline",
+        action="store_true",
+        help="Ask native resolvers not to reach the network",
+    )
+    parser.add_argument(
+        "--require-native-resolution",
+        dest="require_native",
+        action="store_true",
+        help="Exit with code 1 when an ecosystem's native resolver could not "
+             "run (default: fall back to static analysis)",
+    )
+    parser.add_argument(
+        "--resolver-timeout",
         "--maven-timeout",
+        dest="resolver_timeout",
         type=int,
-        default=MAVEN_TIMEOUT_SECONDS,
+        default=DEFAULT_RESOLVER_TIMEOUT,
         metavar="SECONDS",
-        help=f"Time budget for one Maven resolution "
-             f"(default: {MAVEN_TIMEOUT_SECONDS})",
+        help=f"Time budget for one native resolution "
+             f"(default: {DEFAULT_RESOLVER_TIMEOUT})",
     )
 
     args = parser.parse_args()
@@ -2317,6 +4468,14 @@ test -- and --no-maven turns the execution off entirely.
     quiet = args.format == "json"
     if not quiet:
         console.print("[bold]checkdeps[/bold] -- CVE scanner via OSV (https://osv.dev)\n")
+        if args.verbose:
+            manager = detect_package_manager()
+            console.print(
+                f"[dim]platform: {describe_platform()}"
+                + (f", {manager.display_name} detected" if manager
+                   else ", no supported package manager detected")
+                + "[/dim]"
+            )
         console.print("[dim]Parsing dependency files...[/dim]")
 
     options = ScanOptions(
@@ -2325,8 +4484,11 @@ test -- and --no-maven turns the execution off entirely.
                   else VersionResolver()),
         skip_dev=args.skip_dev,
         verbose=args.verbose,
-        no_maven=args.no_maven,
-        maven_timeout=args.maven_timeout,
+        no_native=args.no_native,
+        offline=args.offline,
+        require_native=args.require_native,
+        resolver_timeout=args.resolver_timeout,
+        rerun_hint="checkdeps " + " ".join(str(p) for p in scan_paths),
     )
 
     report = discover_and_parse(
@@ -2342,7 +4504,7 @@ test -- and --no-maven turns the execution off entirely.
         sys.exit(1 if (args.fail_on_unresolved and report.errors) else 0)
 
     if args.verbose and not quiet:
-        print_resolved_maven(report)
+        print_resolved_dependencies(report)
 
     matchable = sum(1 for d in report.dependencies if d.resolved)
     if not quiet:
@@ -2357,6 +4519,9 @@ test -- and --no-maven turns the execution off entirely.
     else:
         count = print_table_output(report, vuln_map, min_severity=args.min_severity)
 
+    if args.require_native and any(
+            issue.kind == "native_resolution_required" for issue in report.issues):
+        sys.exit(1)
     if args.fail_on_vuln and count > 0:
         sys.exit(1)
     if args.fail_on_unresolved and (report.unresolved or report.errors):

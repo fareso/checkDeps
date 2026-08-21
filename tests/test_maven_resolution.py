@@ -16,9 +16,6 @@ rather than recomputing it.
 
 import json
 import os
-import stat
-import subprocess
-import sys
 import tempfile
 from pathlib import Path
 
@@ -27,17 +24,17 @@ import pytest
 import checkdeps
 from checkdeps import (
     Dependency,
-    MavenErrorKind,
+    MavenResolver,
     ScanOptions,
+    ToolErrorKind,
     _dedupe,
-    _load_maven_trees,
-    _maven_command_line,
+    _dependencies_from_tree,
     _parse_maven_id,
     discover_and_parse,
-    find_maven_command,
-    parse_pom,
-    resolve_maven_dependencies,
+    json_objects,
+    resolution_context,
 )
+from fake_tools import install_fake_tool, install_on_path, invocations
 
 
 # ---------------------------------------------------------------------------
@@ -114,83 +111,12 @@ SPRING_BOOT_POM = """<?xml version="1.0" encoding="UTF-8"?>
 </project>
 """
 
+MAVEN_PROFILE = checkdeps.PROFILES_BY_ECOSYSTEM["Maven"]
+
 
 # ---------------------------------------------------------------------------
-# The stand-in Maven
+# Helpers
 # ---------------------------------------------------------------------------
-
-FAKE_MAVEN = '''\
-import json
-import sys
-import time
-from pathlib import Path
-
-config = json.loads(Path(__file__).with_name("fake_maven_config.json").read_text())
-
-Path(__file__).with_name("fake_maven_argv.json").write_text(
-    json.dumps({"argv": sys.argv[1:], "cwd": str(Path.cwd())})
-)
-
-if config.get("delay"):
-    time.sleep(config["delay"])
-
-output_file = None
-for arg in sys.argv[1:]:
-    if arg.startswith("-DoutputFile="):
-        output_file = Path(arg.split("=", 1)[1])
-
-if output_file is not None and config.get("payload") is not None:
-    mode = "a" if "-DappendOutput=true" in sys.argv else "w"
-    with open(output_file, mode, encoding="utf-8") as handle:
-        handle.write(config["payload"])
-
-sys.stdout.write(config.get("stdout", ""))
-sys.stderr.write(config.get("stderr", ""))
-sys.exit(config.get("exit_code", 0))
-'''
-
-
-def install_fake_maven(project: Path, *, payload=None, exit_code=0, stdout="",
-                       stderr="", delay=0, name=None):
-    """Install a fake Maven Wrapper into ``project`` and return its path."""
-    project.mkdir(parents=True, exist_ok=True)
-    script = project / "fake_maven.py"
-    script.write_text(FAKE_MAVEN, encoding="utf-8")
-    if isinstance(payload, (dict, list)):
-        payload = json.dumps(payload)
-    (project / "fake_maven_config.json").write_text(
-        json.dumps({
-            "payload": payload,
-            "exit_code": exit_code,
-            "stdout": stdout,
-            "stderr": stderr,
-            "delay": delay,
-        }),
-        encoding="utf-8",
-    )
-
-    if name is None:
-        name = "mvnw.cmd" if os.name == "nt" else "mvnw"
-    wrapper = project / name
-    if name.endswith((".cmd", ".bat")):
-        wrapper.write_text(
-            "@echo off\r\n"
-            f'"{sys.executable}" "{script}" %*\r\n'
-            "exit /b %ERRORLEVEL%\r\n",
-            encoding="utf-8",
-        )
-    else:
-        wrapper.write_text(
-            "#!/bin/sh\n" f'exec "{sys.executable}" "{script}" "$@"\n',
-            encoding="utf-8",
-        )
-        wrapper.chmod(wrapper.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP)
-    return wrapper
-
-
-def maven_argv(project: Path) -> dict:
-    """What the fake Maven was actually invoked with."""
-    return json.loads((project / "fake_maven_argv.json").read_text())
 
 
 def write_pom(project: Path, body=SPRING_BOOT_POM, name="pom.xml") -> Path:
@@ -198,6 +124,42 @@ def write_pom(project: Path, body=SPRING_BOOT_POM, name="pom.xml") -> Path:
     pom = project / name
     pom.write_text(body, encoding="utf-8")
     return pom
+
+
+def install_fake_maven(project: Path, name=None, **kwargs) -> Path:
+    """Install a stand-in Maven Wrapper that writes a canned dependency tree."""
+    if name is None:
+        name = "mvnw.cmd" if os.name == "nt" else "mvnw"
+    kwargs.setdefault("output_file_flag", "-DoutputFile=")
+    kwargs.setdefault("append_flag", "-DappendOutput=true")
+    return install_fake_tool(project, name, **kwargs)
+
+
+def maven_context(project: Path, options=None):
+    return resolution_context(MAVEN_PROFILE, project, options or ScanOptions())
+
+
+def resolve_maven(project: Path, options=None, timeout=None):
+    """Run the Maven resolver over a project exactly as a scan would."""
+    options = options or ScanOptions()
+    if timeout is not None:
+        options.resolver_timeout = timeout
+    ctx = maven_context(project, options)
+    resolver = MavenResolver()
+    command = resolver.find_command(ctx)
+    if command is None:
+        return checkdeps.failed(resolver, ToolErrorKind.TOOL_NOT_FOUND,
+                                "no Maven wrapper and no mvn on PATH")
+    return resolver.resolve(ctx, command)
+
+
+def scan(project: Path, options=None):
+    return discover_and_parse([project], options=options or ScanOptions(),
+                              quiet=True)
+
+
+def maven_record(report):
+    return next(r for r in report.records if r.ecosystem == "Maven")
 
 
 def temp_leftovers() -> set:
@@ -209,81 +171,85 @@ def by_name(deps) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# 1-6: Maven executable detection
+# Maven executable detection
 # ---------------------------------------------------------------------------
 
 
 def test_detects_no_maven_when_nothing_is_available(tmp_path, monkeypatch):
-    monkeypatch.setattr(checkdeps.shutil, "which", lambda name: None)
-    assert find_maven_command(tmp_path) is None
+    install_on_path(monkeypatch, checkdeps)
+    assert MavenResolver().find_command(maven_context(tmp_path)) is None
 
 
 def test_detects_mvn_on_path(tmp_path, monkeypatch):
-    monkeypatch.setattr(checkdeps.shutil, "which",
-                        lambda name: r"C:\apache-maven\bin\mvn.cmd")
-    command = find_maven_command(tmp_path)
+    install_on_path(monkeypatch, checkdeps, mvn=r"C:\apache-maven\bin\mvn.cmd")
+    command = MavenResolver().find_command(maven_context(tmp_path))
     assert command.source == "path"
     assert command.argv == [r"C:\apache-maven\bin\mvn.cmd"]
 
 
 def test_wrapper_is_preferred_over_global_maven(tmp_path, monkeypatch):
-    monkeypatch.setattr(checkdeps.shutil, "which", lambda name: "/usr/bin/mvn")
+    install_on_path(monkeypatch, checkdeps, mvn="/usr/bin/mvn")
     wrapper = tmp_path / ("mvnw.cmd" if os.name == "nt" else "mvnw")
     wrapper.write_text("")
 
-    command = find_maven_command(tmp_path)
+    command = MavenResolver().find_command(maven_context(tmp_path))
     assert command.source == "wrapper"
     assert command.argv == [str(wrapper.resolve())]
 
 
 @pytest.mark.skipif(os.name != "nt", reason="mvnw.cmd is the Windows wrapper")
 def test_windows_wrapper_is_mvnw_cmd(tmp_path, monkeypatch):
-    monkeypatch.setattr(checkdeps.shutil, "which", lambda name: None)
+    install_on_path(monkeypatch, checkdeps)
     (tmp_path / "mvnw").write_text("")          # the Unix wrapper is not runnable
     (tmp_path / "mvnw.cmd").write_text("")
-    assert find_maven_command(tmp_path).display.endswith("mvnw.cmd")
+    command = MavenResolver().find_command(maven_context(tmp_path))
+    assert command.display.endswith("mvnw.cmd")
 
 
 @pytest.mark.skipif(os.name == "nt", reason="./mvnw is the Unix wrapper")
 def test_unix_wrapper_is_mvnw(tmp_path, monkeypatch):
-    monkeypatch.setattr(checkdeps.shutil, "which", lambda name: None)
+    install_on_path(monkeypatch, checkdeps)
     (tmp_path / "mvnw").write_text("")
-    assert find_maven_command(tmp_path).display.endswith("mvnw")
+    command = MavenResolver().find_command(maven_context(tmp_path))
+    assert command.display.endswith("mvnw")
 
 
 def test_wrapper_is_found_at_the_reactor_root(tmp_path, monkeypatch):
     """A multi-module build keeps one wrapper at the top, not per module."""
-    monkeypatch.setattr(checkdeps.shutil, "which", lambda name: None)
+    install_on_path(monkeypatch, checkdeps)
     wrapper = tmp_path / ("mvnw.cmd" if os.name == "nt" else "mvnw")
     wrapper.write_text("")
     module = tmp_path / "service"
     module.mkdir()
 
-    assert find_maven_command(module).display == str(wrapper.resolve())
+    command = MavenResolver().find_command(maven_context(module))
+    assert command.display == str(wrapper.resolve())
 
 
 # ---------------------------------------------------------------------------
-# 7-10: dependency-tree parsing
+# Dependency-tree parsing
 # ---------------------------------------------------------------------------
+
+
+def collect(tree_object, source="pom.xml") -> dict:
+    into = {}
+    _dependencies_from_tree(tree_object, source, into)
+    return by_name(into.values())
 
 
 def test_parses_expanded_json_tree():
-    trees = _load_maven_trees(json.dumps(SPRING_BOOT_TREE))
-    collected = {}
-    checkdeps._dependencies_from_tree(trees[0], "backend/pom.xml", collected)
-    deps = by_name(collected.values())
+    deps = collect(json_objects(json.dumps(SPRING_BOOT_TREE))[0], "backend/pom.xml")
+    web = deps["org.springframework:spring-web"]
 
-    assert deps["org.springframework:spring-web"].version == "7.0.4"
-    assert deps["org.springframework:spring-web"].ecosystem == "Maven"
-    assert deps["org.springframework:spring-web"].source_file == "backend/pom.xml"
-    assert deps["org.springframework:spring-web"].resolution == "maven"
+    assert web.version == "7.0.4"
+    assert web.ecosystem == "Maven"
+    assert web.source_file == "backend/pom.xml"
+    assert web.resolution == "native"
+    assert web.resolver == "maven"
 
 
 def test_direct_and_transitive_are_distinguished():
-    trees = _load_maven_trees(json.dumps(SPRING_BOOT_TREE))
-    collected = {}
-    checkdeps._dependencies_from_tree(trees[0], "pom.xml", collected)
-    deps = by_name(collected.values())
+    deps = collect(SPRING_BOOT_TREE)
 
     assert deps["org.springframework.boot:spring-boot-starter-web"].direct is True
     assert deps["org.postgresql:postgresql"].direct is True
@@ -292,11 +258,16 @@ def test_direct_and_transitive_are_distinguished():
     assert deps["org.apache.tomcat.embed:tomcat-embed-core"].direct is False
 
 
+def test_dependency_provenance_is_kept():
+    deps = collect(SPRING_BOOT_TREE)
+    assert deps["org.springframework:spring-core"].introduced_by == (
+        "org.springframework:spring-web")
+    assert deps["org.springframework.boot:spring-boot-starter-web"].introduced_by \
+        is None
+
+
 def test_scope_is_preserved():
-    trees = _load_maven_trees(json.dumps(SPRING_BOOT_TREE))
-    collected = {}
-    checkdeps._dependencies_from_tree(trees[0], "pom.xml", collected)
-    deps = by_name(collected.values())
+    deps = collect(SPRING_BOOT_TREE)
 
     assert deps["org.postgresql:postgresql"].scope == "runtime"
     assert deps["org.postgresql:postgresql"].is_dev is False
@@ -306,15 +277,12 @@ def test_scope_is_preserved():
 
 
 def test_root_project_is_not_reported_as_a_dependency():
-    trees = _load_maven_trees(json.dumps(SPRING_BOOT_TREE))
-    collected = {}
-    checkdeps._dependencies_from_tree(trees[0], "pom.xml", collected)
-    assert "com.example:demo" not in by_name(collected.values())
+    assert "com.example:demo" not in collect(SPRING_BOOT_TREE)
 
 
 def test_id_only_tree_from_older_plugin_versions():
     """Plugin versions that emit a bare coordinate string are still readable."""
-    raw = {
+    deps = collect({
         "id": "com.example:demo:jar:1.0",
         "children": [
             {
@@ -325,10 +293,7 @@ def test_id_only_tree_from_older_plugin_versions():
                 ],
             }
         ],
-    }
-    collected = {}
-    checkdeps._dependencies_from_tree(raw, "pom.xml", collected)
-    deps = by_name(collected.values())
+    })
 
     assert deps["org.springframework:spring-web"].version == "7.0.4"
     assert deps["org.springframework:spring-web"].scope == "compile"
@@ -349,11 +314,9 @@ def test_maven_id_shapes(raw, expected):
 
 
 def test_classifier_is_kept():
-    raw = {"id": "com.example:demo:jar:1.0", "children": [
-        {"id": "org.example:library:jar:tests:2.0:test", "children": []}]}
-    collected = {}
-    checkdeps._dependencies_from_tree(raw, "pom.xml", collected)
-    dep = list(collected.values())[0]
+    deps = collect({"id": "com.example:demo:jar:1.0", "children": [
+        {"id": "org.example:library:jar:tests:2.0:test", "children": []}]})
+    dep = deps["org.example:library"]
     assert dep.classifier == "tests"
     assert dep.artifact_type == "jar"
 
@@ -361,17 +324,18 @@ def test_classifier_is_kept():
 def test_repeated_subtree_is_recorded_once():
     """Maven prints a shared artifact under every parent that reaches it."""
     shared = node("org.example:shared:1.0")
-    payload = tree(node("org.example:a:1.0", shared), node("org.example:b:1.0", shared))
-    collected = {}
-    checkdeps._dependencies_from_tree(payload, "pom.xml", collected)
-    assert [d.name for d in collected.values()].count("org.example:shared") == 1
+    into = {}
+    _dependencies_from_tree(
+        tree(node("org.example:a:1.0", shared), node("org.example:b:1.0", shared)),
+        "pom.xml", into)
+    assert [d.name for d in into.values()].count("org.example:shared") == 1
 
 
 def test_invalid_json_is_reported_not_raised():
     with pytest.raises(ValueError):
-        _load_maven_trees("not json at all")
+        json_objects("not json at all")
     with pytest.raises(ValueError):
-        _load_maven_trees("   ")
+        json_objects("   ")
 
 
 def test_multi_module_output_is_a_stream_of_trees():
@@ -381,19 +345,19 @@ def test_multi_module_output_is_a_stream_of_trees():
     service = tree(node("org.example:library:1.0"), node("org.example:other:2.0"))
     service["artifactId"] = "service"
 
-    trees = _load_maven_trees(json.dumps(api) + "\n" + json.dumps(service))
+    trees = json_objects(json.dumps(api) + "\n" + json.dumps(service))
     assert len(trees) == 2
 
-    collected = {}
+    into = {}
     for one in trees:
-        checkdeps._dependencies_from_tree(one, "pom.xml", collected)
-    assert sorted(by_name(collected.values())) == [
+        _dependencies_from_tree(one, "pom.xml", into)
+    assert sorted(by_name(into.values())) == [
         "org.example:library", "org.example:other"
     ]
 
 
 # ---------------------------------------------------------------------------
-# 11: deduplication
+# Deduplication
 # ---------------------------------------------------------------------------
 
 
@@ -401,7 +365,7 @@ def test_same_package_version_across_modules_is_one_osv_query():
     def dep(source, direct=False):
         return Dependency(name="org.springframework:spring-core", version="7.0.4",
                           ecosystem="Maven", source_file=source, direct=direct,
-                          resolution="maven")
+                          resolver="maven")
 
     unique = _dedupe([dep("backend/api/pom.xml"),
                       dep("backend/service/pom.xml", direct=True)])
@@ -415,7 +379,7 @@ def test_different_versions_are_not_deduplicated():
     def dep(version):
         return Dependency(name="org.example:library", version=version,
                           ecosystem="Maven", source_file="pom.xml",
-                          resolution="maven")
+                          resolver="maven")
 
     assert len(_dedupe([dep("1.0"), dep("2.0")])) == 2
 
@@ -426,8 +390,9 @@ def test_different_versions_are_not_deduplicated():
 
 
 def test_command_uses_a_pinned_plugin_and_json_output(tmp_path):
-    command = checkdeps.MavenCommand(["mvn"], "mvn", "path")
-    argv = _maven_command_line(command, tmp_path / "pom.xml", tmp_path / "out.json")
+    command = checkdeps.ToolCommand(["mvn"], "mvn", "path")
+    argv = MavenResolver().command_line(tmp_path / "pom.xml", tmp_path / "out.json",
+                                        command)
 
     goal = f"{checkdeps.MAVEN_DEPENDENCY_PLUGIN}:" \
            f"{checkdeps.MAVEN_DEPENDENCY_PLUGIN_VERSION}:tree"
@@ -440,32 +405,35 @@ def test_command_uses_a_pinned_plugin_and_json_output(tmp_path):
 
 
 def test_non_default_pom_name_is_passed_with_f(tmp_path):
-    command = checkdeps.MavenCommand(["mvn"], "mvn", "path")
-    argv = _maven_command_line(command, tmp_path / "backend-pom.xml",
-                               tmp_path / "out.json")
+    command = checkdeps.ToolCommand(["mvn"], "mvn", "path")
+    resolver = MavenResolver()
+    argv = resolver.command_line(tmp_path / "backend-pom.xml",
+                                 tmp_path / "out.json", command)
     assert argv[argv.index("-f") + 1] == str(tmp_path / "backend-pom.xml")
 
-    argv = _maven_command_line(command, tmp_path / "pom.xml", tmp_path / "out.json")
+    argv = resolver.command_line(tmp_path / "pom.xml", tmp_path / "out.json",
+                                 command)
     assert "-f" not in argv
 
 
 def test_resolution_runs_maven_in_the_project_directory(tmp_path):
     project = tmp_path / "backend"
-    pom = write_pom(project)
+    write_pom(project)
     install_fake_maven(project, payload=SPRING_BOOT_TREE)
 
-    resolution = resolve_maven_dependencies(pom)
+    resolution = resolve_maven(project)
 
     assert resolution.ok, resolution.reason
-    assert Path(maven_argv(project)["cwd"]).resolve() == project.resolve()
+    call = invocations(project, "mvnw")[0]
+    assert Path(call["cwd"]).resolve() == project.resolve()
 
 
 def test_resolution_returns_the_graph_maven_reported(tmp_path):
     project = tmp_path / "backend"
-    pom = write_pom(project)
+    write_pom(project)
     install_fake_maven(project, payload=SPRING_BOOT_TREE)
 
-    deps = by_name(resolve_maven_dependencies(pom).dependencies)
+    deps = by_name(resolve_maven(project).dependencies)
 
     # Declared without a <version>: only Maven knows these (spec 10 and 29).
     assert deps["org.springframework.boot:spring-boot-starter-web"].version == "4.0.3"
@@ -478,10 +446,10 @@ def test_resolution_returns_the_graph_maven_reported(tmp_path):
 
 def test_paths_containing_spaces(tmp_path):
     project = tmp_path / "my maven project" / "back end"
-    pom = write_pom(project)
+    write_pom(project)
     install_fake_maven(project, payload=SPRING_BOOT_TREE)
 
-    resolution = resolve_maven_dependencies(pom)
+    resolution = resolve_maven(project)
 
     assert resolution.ok, resolution.reason
     assert len(resolution.dependencies) == len(by_name(resolution.dependencies))
@@ -489,11 +457,11 @@ def test_paths_containing_spaces(tmp_path):
 
 def test_temporary_file_is_removed_on_success(tmp_path):
     project = tmp_path / "backend"
-    pom = write_pom(project)
+    write_pom(project)
     install_fake_maven(project, payload=SPRING_BOOT_TREE)
 
     before = temp_leftovers()
-    assert resolve_maven_dependencies(pom).ok
+    assert resolve_maven(project).ok
     assert temp_leftovers() - before == set()
     # ...and nothing was written into the project either.
     assert not list(project.glob("*dependency*"))
@@ -501,189 +469,170 @@ def test_temporary_file_is_removed_on_success(tmp_path):
 
 def test_temporary_file_is_removed_on_failure(tmp_path):
     project = tmp_path / "backend"
-    pom = write_pom(project)
+    write_pom(project)
     install_fake_maven(project, exit_code=1, stdout="[ERROR] boom")
 
     before = temp_leftovers()
-    assert not resolve_maven_dependencies(pom).ok
+    assert not resolve_maven(project).ok
     assert temp_leftovers() - before == set()
 
 
 def test_timeout_is_bounded_and_classified(tmp_path):
     project = tmp_path / "backend"
-    pom = write_pom(project)
+    write_pom(project)
     install_fake_maven(project, payload=SPRING_BOOT_TREE, delay=5)
 
     before = temp_leftovers()
-    resolution = resolve_maven_dependencies(pom, timeout=1)
+    resolution = resolve_maven(project, timeout=1)
 
-    assert resolution.error == MavenErrorKind.TIMEOUT
+    assert resolution.error == ToolErrorKind.TIMEOUT
     assert "1s" in resolution.reason
     assert temp_leftovers() - before == set()
 
 
-def test_unstartable_wrapper_is_classified(tmp_path):
-    project = tmp_path / "backend"
-    pom = write_pom(project)
-    wrapper = install_fake_maven(project, payload=SPRING_BOOT_TREE)
-    wrapper.write_text("")          # empty: nothing the OS can execute
-
-    resolution = resolve_maven_dependencies(pom)
-
-    assert resolution.error == MavenErrorKind.NOT_FOUND
-    assert "could not start" in resolution.reason
-
-
-def test_unstartable_wrapper_falls_through_to_maven_on_path(tmp_path, monkeypatch):
-    """A checkout that lost the wrapper's executable bit is not a Maven-less project."""
-    project = tmp_path / "backend"
-    pom = write_pom(project)
-    (project / "mvnw").write_text("")           # present, but unusable
-    (project / "mvnw.cmd").write_text("")
-    on_path = install_fake_maven(project, payload=SPRING_BOOT_TREE, name="mvn-stub.cmd"
-                                 if os.name == "nt" else "mvn-stub")
-    monkeypatch.setattr(checkdeps.shutil, "which",
-                        lambda name: str(on_path) if name == "mvn" else None)
-
-    report = parse_pom(pom, ScanOptions())
-
-    assert by_name(report.dependencies)["org.postgresql:postgresql"].version == "42.7.8"
-    assert any("would not start" in note for note in report.notes)
-
-
 def test_missing_maven_is_classified(tmp_path, monkeypatch):
-    monkeypatch.setattr(checkdeps.shutil, "which", lambda name: None)
-    resolution = resolve_maven_dependencies(write_pom(tmp_path / "backend"))
-    assert resolution.error == MavenErrorKind.NOT_FOUND
+    install_on_path(monkeypatch, checkdeps)
+    write_pom(tmp_path / "backend")
+    assert resolve_maven(tmp_path / "backend").error == ToolErrorKind.TOOL_NOT_FOUND
 
 
 def test_unresolvable_artifact_is_classified(tmp_path):
     project = tmp_path / "backend"
-    pom = write_pom(project)
+    write_pom(project)
     install_fake_maven(project, exit_code=1, stdout=(
         "[INFO] Scanning for projects...\n"
         "[ERROR] Failed to execute goal on project demo: Could not resolve "
         "artifact com.example:internal-lib:2.1.0\n"
     ))
 
-    resolution = resolve_maven_dependencies(pom)
+    resolution = resolve_maven(project)
 
-    assert resolution.error == MavenErrorKind.DEPENDENCY_RESOLUTION_FAILED
+    assert resolution.error == ToolErrorKind.RESOLUTION_FAILED
     assert "com.example:internal-lib:2.1.0" in resolution.reason
 
 
 def test_unusable_plugin_is_classified(tmp_path):
     project = tmp_path / "backend"
-    pom = write_pom(project)
+    write_pom(project)
     install_fake_maven(project, exit_code=1, stdout=(
         "[ERROR] Plugin org.apache.maven.plugins:maven-dependency-plugin:3.8.1 "
         "or one of its dependencies could not be resolved\n"
     ))
-    assert resolve_maven_dependencies(pom).error == MavenErrorKind.PLUGIN_FAILED
+    assert resolve_maven(project).error == ToolErrorKind.TOOL_EXECUTION_FAILED
 
 
 def test_unparseable_output_is_classified(tmp_path):
     project = tmp_path / "backend"
-    pom = write_pom(project)
+    write_pom(project)
     install_fake_maven(project, payload="<<not json>>")
 
-    resolution = resolve_maven_dependencies(pom)
+    resolution = resolve_maven(project)
 
-    assert resolution.error == MavenErrorKind.OUTPUT_INVALID
+    assert resolution.error == ToolErrorKind.OUTPUT_INVALID
     assert "JSON" in resolution.reason
 
 
 def test_missing_output_file_is_classified(tmp_path):
     """Maven claimed success but wrote nothing -- do not report zero deps."""
     project = tmp_path / "backend"
-    pom = write_pom(project)
+    write_pom(project)
     install_fake_maven(project, payload=None)
 
-    resolution = resolve_maven_dependencies(pom)
-    assert resolution.error == MavenErrorKind.OUTPUT_INVALID
+    assert resolve_maven(project).error == ToolErrorKind.OUTPUT_INVALID
 
 
-# ---------------------------------------------------------------------------
-# parse_pom: Maven first, static pom.xml as the fallback
-# ---------------------------------------------------------------------------
-
-
-def test_parse_pom_uses_maven_without_any_extra_flag(tmp_path):
+def test_unstartable_wrapper_is_classified(tmp_path):
     project = tmp_path / "backend"
-    pom = write_pom(project)
+    write_pom(project)
+    install_fake_maven(project, payload=SPRING_BOOT_TREE, runnable=False)
+
+    resolution = resolve_maven(project)
+
+    assert resolution.error == ToolErrorKind.TOOL_NOT_FOUND
+    assert "could not start" in resolution.reason
+
+
+# ---------------------------------------------------------------------------
+# Scanning a Maven project: Maven first, static pom.xml as the fallback
+# ---------------------------------------------------------------------------
+
+
+def test_scan_uses_maven_without_any_extra_flag(tmp_path):
+    project = tmp_path / "backend"
+    write_pom(project)
     install_fake_maven(project, payload=SPRING_BOOT_TREE)
 
-    report = parse_pom(pom, ScanOptions())      # default options: no opt-in
+    report = scan(project)                      # default options: no opt-in
     deps = by_name(report.dependencies)
+    record = maven_record(report)
 
     assert deps["org.springframework.boot:spring-boot-starter-web"].version == "4.0.3"
     assert report.unresolved == []
-    assert any("Maven detected" in note for note in report.notes)
-    assert report.detail == [
-        "     [cyan]4[/cyan] direct dependencies",
-        "     [cyan]5[/cyan] transitive dependencies",
-        "     [cyan]9[/cyan] resolved dependencies",
-    ]
+    assert record.native is True
+    assert record.resolver == "Maven Wrapper"
+    assert (record.direct, record.transitive, record.total) == (4, 5, 9)
 
 
-def test_parse_pom_falls_back_when_maven_is_unavailable(tmp_path, monkeypatch):
-    monkeypatch.setattr(checkdeps.shutil, "which", lambda name: None)
-    pom = write_pom(tmp_path / "backend")
+def test_scan_falls_back_when_maven_is_unavailable(tmp_path, monkeypatch):
+    install_on_path(monkeypatch, checkdeps)
+    write_pom(tmp_path / "backend")
 
-    report = parse_pom(pom, ScanOptions())
+    report = scan(tmp_path / "backend")
+    record = maven_record(report)
 
     # The static parser knows the three declared packages and no versions.
     assert len(report.dependencies) == 3
     assert len(report.unresolved) == 3
-    assert any("Maven unavailable" in note for note in report.notes)
+    assert record.native is False
+    assert record.resolver == "static pom.xml analysis"
+    assert record.missing_tool.tool_id == "maven"
     assert report.errors == []      # a fallback is not a scan failure
 
 
-def test_parse_pom_falls_back_when_maven_fails(tmp_path):
+def test_scan_falls_back_when_maven_fails(tmp_path):
     project = tmp_path / "backend"
-    pom = write_pom(project)
+    write_pom(project)
     install_fake_maven(project, exit_code=1, stdout=(
         "[ERROR] Could not resolve artifact com.example:internal-lib:2.1.0\n"
     ))
 
-    report = parse_pom(pom, ScanOptions())
+    report = scan(project)
+    record = maven_record(report)
 
     assert len(report.dependencies) == 3        # static parser output
-    assert any("resolution failed" in note for note in report.notes)
-    assert any("com.example:internal-lib:2.1.0" in note for note in report.notes)
-    issue = report.issues[0]
-    assert issue.kind == "maven_resolution_failed"
-    assert issue.severity == "warning"          # never fatal
-    assert MavenErrorKind.DEPENDENCY_RESOLUTION_FAILED in issue.message
-    assert report.errors == []
+    assert record.native is False
+    assert any(ToolErrorKind.RESOLUTION_FAILED in w for w in record.warnings)
+    assert any("com.example:internal-lib:2.1.0" in w for w in record.warnings)
+    assert record.missing_tool is None          # Maven was there, it just failed
+    assert report.errors == []                  # never fatal
 
 
 def test_verbose_shows_maven_output_only_when_asked(tmp_path):
     project = tmp_path / "backend"
-    pom = write_pom(project)
+    write_pom(project)
     install_fake_maven(project, exit_code=1, stdout=(
         "[INFO] pages and pages of build log\n"
         "[ERROR] Failed to execute goal on project demo\n"
     ))
 
-    quiet = parse_pom(pom, ScanOptions())
-    loud = parse_pom(pom, ScanOptions(verbose=True))
+    quiet = maven_record(scan(project))
+    loud = maven_record(scan(project, ScanOptions(verbose=True)))
 
     # Normal operation shows the one-line reason and no Maven log at all.
-    assert any("Failed to execute goal" in note for note in quiet.notes)
-    assert not any("pages and pages" in note for note in quiet.notes)
-    assert any("pages and pages" in note for note in loud.notes)
+    assert any("Failed to execute goal" in w for w in quiet.warnings)
+    assert not any("pages and pages" in line for line in quiet.diagnostics)
+    assert any("pages and pages" in line for line in loud.diagnostics)
 
 
-def test_no_maven_option_never_executes_maven(tmp_path):
+def test_no_native_option_never_executes_maven(tmp_path):
     project = tmp_path / "backend"
-    pom = write_pom(project)
+    write_pom(project)
     install_fake_maven(project, payload=SPRING_BOOT_TREE)
 
-    report = parse_pom(pom, ScanOptions(no_maven=True))
+    report = scan(project, ScanOptions(no_native=True))
 
     assert len(report.unresolved) == 3
-    assert not (project / "fake_maven_argv.json").exists()
+    assert invocations(project, "mvnw") == []
 
 
 # ---------------------------------------------------------------------------
@@ -691,17 +640,12 @@ def test_no_maven_option_never_executes_maven(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def scan(project: Path, options=None):
-    return discover_and_parse([project], options=options or ScanOptions(), quiet=True)
-
-
 def test_explicit_version_is_resolved(tmp_path):
     project = tmp_path / "explicit"
-    write_pom(project, SPRING_BOOT_POM)
+    write_pom(project)
     install_fake_maven(project, payload=tree(node("org.example:library:1.2.3")))
 
-    deps = by_name(scan(project).dependencies)
-    assert deps["org.example:library"].version == "1.2.3"
+    assert by_name(scan(project).dependencies)["org.example:library"].version == "1.2.3"
 
 
 def test_property_version_is_expanded_by_maven(tmp_path):
@@ -725,7 +669,7 @@ def test_property_version_is_expanded_by_maven(tmp_path):
 
     deps = by_name(scan(project).dependencies)
     assert deps["org.example:library"].version == "4.5.6"
-    assert scan(project, ScanOptions(no_maven=True)).unresolved != []
+    assert scan(project, ScanOptions(no_native=True)).unresolved != []
 
 
 def test_transitive_dependencies_reach_the_osv_query(tmp_path):
@@ -733,8 +677,7 @@ def test_transitive_dependencies_reach_the_osv_query(tmp_path):
     write_pom(project)
     install_fake_maven(project, payload=SPRING_BOOT_TREE)
 
-    report = scan(project)
-    scannable = {d.name for d in report.dependencies if d.resolved}
+    scannable = {d.name for d in scan(project).dependencies if d.resolved}
 
     assert "org.apache.tomcat.embed:tomcat-embed-core" in scannable
     assert "org.springframework:spring-webmvc" in scannable
@@ -765,8 +708,7 @@ def test_multi_module_reactor_produces_one_record_per_package_version(tmp_path):
     service["artifactId"] = "service"
     install_fake_maven(project, payload=json.dumps(api) + json.dumps(service))
 
-    report = scan(project)
-    names = [d.name for d in report.dependencies]
+    names = [d.name for d in scan(project).dependencies]
 
     assert names.count("org.springframework:spring-core") == 1
     assert "org.example:only-in-service" in names
@@ -777,8 +719,7 @@ def test_skip_dev_still_drops_test_scope(tmp_path):
     write_pom(project)
     install_fake_maven(project, payload=SPRING_BOOT_TREE)
 
-    report = scan(project, ScanOptions(skip_dev=True))
-    names = {d.name for d in report.dependencies}
+    names = {d.name for d in scan(project, ScanOptions(skip_dev=True)).dependencies}
 
     assert "org.springframework.boot:spring-boot-starter-test" not in names
     assert "org.postgresql:postgresql" in names      # runtime scope is kept
@@ -791,6 +732,18 @@ def test_other_ecosystems_are_untouched(tmp_path):
     deps = by_name(scan(tmp_path).dependencies)
     assert deps["lodash"].version == "4.17.20"
     assert deps["lodash"].direct is True
+
+
+def test_named_pom_file_still_gets_maven_resolution(tmp_path):
+    """Pointing at backend/pom.xml means the same as pointing at backend/."""
+    project = tmp_path / "backend"
+    pom = write_pom(project)
+    install_fake_maven(project, payload=SPRING_BOOT_TREE)
+
+    report = discover_and_parse([pom], options=ScanOptions(), quiet=True)
+
+    assert maven_record(report).native is True
+    assert len(report.dependencies) == 9
 
 
 # ---------------------------------------------------------------------------
@@ -806,7 +759,7 @@ def test_real_maven_resolves_a_managed_version(tmp_path):
     project = tmp_path / "real"
     write_pom(project, SPRING_BOOT_POM)
 
-    resolution = resolve_maven_dependencies(project / "pom.xml")
+    resolution = resolve_maven(project, timeout=600)
 
     assert resolution.ok, resolution.reason
     deps = by_name(resolution.dependencies)

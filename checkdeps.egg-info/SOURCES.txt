@@ -1,3 +1,4 @@
+README.md
 checkdeps.py
 pyproject.toml
 checkdeps.egg-info/PKG-INFO
@@ -6,3 +7,5 @@ checkdeps.egg-info/dependency_links.txt
 checkdeps.egg-info/entry_points.txt
 checkdeps.egg-info/requires.txt
 checkdeps.egg-info/top_level.txt
+tests/test_advisory_matching.py
+tests/test_requirements_parser.py

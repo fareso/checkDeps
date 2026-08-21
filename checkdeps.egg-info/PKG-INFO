@@ -3,5 +3,8 @@ Name: checkdeps
 Version: 1.0.0
 Summary: CVE vulnerability scanner for dependency manifests
 Requires-Python: >=3.11
-Requires-Dist: requests>=2.31.0
+Requires-Dist: packaging>=23.2
+Requires-Dist: requests>=2.33.0
 Requires-Dist: rich>=13.7.0
+Provides-Extra: test
+Requires-Dist: pytest>=8.0; extra == "test"

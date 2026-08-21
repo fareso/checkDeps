@@ -92,6 +92,11 @@ checkdeps pom.xml package.json   # scan specific files
 | `--skip-dev` | Ignore dev/test dependencies |
 | `--format json` | Machine-readable JSON output |
 | `--fail-on-vuln` | Exit with code 1 if any vulnerabilities are found (useful in CI) |
+| `--fail-on-unresolved` | Exit with code 1 if any dependency has no resolved version, or any requirement failed to parse |
+| `--python-version X.Y` | `python_version` used to evaluate PEP 508 markers (default: this interpreter) |
+| `--sys-platform NAME` | `sys_platform` used to evaluate PEP 508 markers (default: this platform) |
+| `--marker-env NAME=VALUE` | Any other PEP 508 marker variable; repeatable |
+| `--resolve-from-env` | Take exact versions from the installed environment where a requirement does not pin one |
 
 ### Examples
 
@@ -104,15 +109,59 @@ checkdeps --skip-dev
 
 # JSON output, only critical issues, exit 1 if found (CI pipeline)
 checkdeps --format json --min-severity CRITICAL --fail-on-vuln
+
+# Evaluate environment markers for a Linux / Python 3.11 deployment target
+checkdeps --python-version 3.11 --sys-platform linux
 ```
 
 ## How it works
 
-1. **Parse** — reads dependency files and extracts package names and pinned versions, resolving range operators (`^`, `~`, `>=`, etc.) to a concrete version string
-2. **Batch query** — sends all packages to the OSV batch API in one request to get a list of vulnerability IDs per package
-3. **Parallel fetch** — fetches full vulnerability details for every unique ID in parallel (up to 20 concurrent requests)
-4. **Cache** — results are stored in `~/.checkDeps/cache.json` with a 2-day TTL; subsequent runs skip the API for any package+version already cached
-5. **Report** — displays a colour-coded table sorted by severity (CRITICAL → HIGH → MEDIUM → LOW), showing the CVE/GHSA ID, summary, and publish date for each finding
+1. **Parse** — reads dependency files and extracts one record per declared package
+2. **Resolve** — works out the *exact* version each record refers to, if one is knowable at all
+3. **Batch query** — sends every resolved package to the OSV batch API in one request to get a list of vulnerability IDs per package
+4. **Parallel fetch** — fetches full vulnerability details for every unique ID in parallel (up to 20 concurrent requests)
+5. **Verify** — re-checks each advisory's affected range against the resolved version using PEP 440 comparison, and drops hits the range does not actually cover
+6. **Cache** — results are stored in `~/.checkDeps/cache.json` with a 2-day TTL; subsequent runs skip the API for any package+version already cached
+7. **Report** — displays a colour-coded table sorted by severity (CRITICAL → HIGH → MEDIUM → LOW), showing the CVE/GHSA ID, summary, and publish date for each finding, followed by anything that could not be matched
+
+## Python dependency parsing
+
+Python requirements are parsed with a real PEP 508 parser (`packaging.requirements.Requirement`), not a regular expression. That means:
+
+- **Extras are metadata, not part of the name or version.** `uvicorn[standard]==0.34.0` is `uvicorn`, extras `[standard]`, version `0.34.0` — the bracket expression never leaks into either field.
+- **Names are canonicalised per PEP 503.** `python_jose`, `Python-JOSE` and `python.jose` all match advisories filed against `python-jose`.
+- **Versions are compared per PEP 440**, never as strings. `0.34.0` is correctly *outside* `<0.11.7`; a string comparison would put it inside.
+- **Environment markers are evaluated** against the scan target. `colorama==0.4.6; sys_platform == "win32"` is skipped, not reported, on a Linux target.
+- **`-r` and `-c` directives are followed** recursively with cycle detection, line-continuations are joined, and `--hash=` options are stripped before parsing. Constraint files pin versions but are not themselves reported as dependencies.
+
+### Unresolved versions
+
+A version is only reported when it is actually known — from an exact `==` / `===` pin, a lockfile, a constraint pin, an immutable wheel/sdist URL, or (with `--resolve-from-env`) the installed environment.
+
+A range (`fastapi>=0.115,<1`), a wildcard (`==1.2.*`), a compatible release (`~=1.2`), a mutable VCS reference or a bare unpinned name names **no single version**. Those records are reported in an *Unresolved versions* section with `vulnerability_match: indeterminate`, and are never sent to OSV. No placeholder version is ever substituted — a fabricated `0.0.0` sits below every `< X` affected range and turns every advisory into a false positive.
+
+Requirements that fail to parse are reported as errors with their file and line number, and no dependency record is emitted for them.
+
+### JSON output
+
+`--format json` prints an object:
+
+```json
+{
+  "scanned": 4,
+  "findings":   [ { "package": "...", "extras": [], "resolved_version": "...", "vulnerabilities": [] } ],
+  "unresolved": [ { "package": "...", "vulnerability_match": "indeterminate" } ],
+  "skipped":    [ { "package": "...", "marker": "...", "vulnerability_match": "skipped" } ],
+  "errors":     [ { "kind": "parse_error", "source": "...", "line": 9 } ]
+}
+```
+
+## Tests
+
+```bash
+pip install -e ".[test]"
+pytest
+```
 
 ## Data source
 

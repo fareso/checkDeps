@@ -3549,9 +3549,32 @@ def scan_named_file(path: Path, options: ScanOptions) -> ParseReport:
     return sub
 
 
+# Never descended into by --recurse: dependency caches, build output and
+# virtual environments hold copies of manifests, not projects of their own.
+# Hidden directories (.git, .gradle, .venv, ...) are skipped as well.
+_RECURSE_SKIP_DIRS = {
+    "node_modules", "__pycache__", "build", "dist", "target", "venv",
+    "site-packages",
+}
+
+
+def _project_dirs(root: Path, recurse: bool) -> list:
+    """The directories to scan under ``root``: just itself, or its whole tree."""
+    if not recurse:
+        return [root]
+    found = []
+    for current, subdirs, _ in os.walk(root):
+        subdirs[:] = sorted(
+            d for d in subdirs
+            if not d.startswith(".") and d not in _RECURSE_SKIP_DIRS
+        )
+        found.append(Path(current))
+    return found
+
+
 def discover_and_parse(paths: list, skip_dev: bool = False,
                        options: ScanOptions | None = None,
-                       quiet: bool = False) -> ParseReport:
+                       quiet: bool = False, recurse: bool = False) -> ParseReport:
     options = options or ScanOptions(skip_dev=skip_dev)
     options.skip_dev = skip_dev or options.skip_dev
     report = ParseReport()
@@ -3564,14 +3587,17 @@ def discover_and_parse(paths: list, skip_dev: bool = False,
 
     for p in paths:
         if p.is_dir():
-            sub = scan_project(p, options)
-            if not sub.records:
-                if not quiet:
-                    console.print(
-                        f"[yellow]Warning:[/yellow] No supported manifest found in {p}"
-                    )
-                continue
-            emit(sub)
+            found_any = False
+            for project_dir in _project_dirs(p, recurse):
+                sub = scan_project(project_dir, options)
+                if sub.records:
+                    found_any = True
+                    emit(sub)
+            if not found_any and not quiet:
+                suffix = " or its subdirectories" if recurse else ""
+                console.print(
+                    f"[yellow]Warning:[/yellow] No supported manifest found in {p}{suffix}"
+                )
         elif p.is_file():
             sub = scan_named_file(p, options)
             if sub is None:
@@ -3681,9 +3707,23 @@ def _load_cache() -> dict:
 def _save_cache(cache: dict) -> None:
     try:
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        CACHE_FILE.write_text(json.dumps(cache), encoding="utf-8")
+        now = time.time()
+        pruned = {k: v for k, v in cache.items() if v.get("expires", 0) > now}
+        CACHE_FILE.write_text(json.dumps(pruned), encoding="utf-8")
     except Exception as e:
         console.print(f"[yellow]Warning:[/yellow] Could not write cache: {e}")
+
+
+def clear_cache() -> None:
+    try:
+        if CACHE_FILE.exists():
+            CACHE_FILE.unlink()
+            console.print(f"[green]Cache cleared:[/green] {CACHE_FILE}")
+        else:
+            console.print(f"[dim]Cache is already empty ({CACHE_FILE})[/dim]")
+    except Exception as e:
+        console.print(f"[red]Error:[/red] Could not clear cache: {e}")
+        sys.exit(1)
 
 
 def _vulns_from_cache(entry: dict) -> list:
@@ -4182,6 +4222,7 @@ def print_table_output(report: ParseReport, vuln_map: dict, min_severity: str) -
         table.add_column("Package", style="bold", no_wrap=True)
         table.add_column("Version", no_wrap=True)
         table.add_column("Ecosystem", no_wrap=True)
+        table.add_column("File", no_wrap=True, style="dim")
         table.add_column("Severity", no_wrap=True, justify="center")
         table.add_column("CVE / ID", no_wrap=True)
         table.add_column("Summary")
@@ -4194,6 +4235,7 @@ def print_table_output(report: ParseReport, vuln_map: dict, min_severity: str) -
                     dep.display_name if i == 0 else "",
                     dep.version if i == 0 else "",
                     dep.ecosystem if i == 0 else "",
+                    dep.location if i == 0 else "",
                     severity_text(vuln.severity),
                     "\n".join(cve_ids),
                     vuln.summary,
@@ -4342,12 +4384,18 @@ def build_environment(args) -> dict:
 
 
 def main():
+    try:
+        _version = importlib.metadata.version("checkdeps")
+    except importlib.metadata.PackageNotFoundError:
+        _version = "unknown"
+
     parser = argparse.ArgumentParser(
         prog="checkdeps",
         description="Check dependency files against the OSV CVE database.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
+  checkdeps --version                show version and exit
   checkdeps                          scan current directory
   checkdeps path/to/project          scan a directory
   checkdeps pom.xml package.json     scan specific files
@@ -4360,6 +4408,8 @@ Examples:
   checkdeps --resolve-from-env       use installed versions where unpinned
   checkdeps --verbose                show the resolved dependency graph
   checkdeps --no-native              never run build tooling; parse statically
+  checkdeps -r                       recurse into subdirectories
+  checkdeps --clear-cache            delete the local cache and exit
 
 Each ecosystem is resolved by its own tooling where that is possible: Maven or
 Gradle (wrapper first) for Java, the npm/Yarn lockfile or pnpm for JavaScript,
@@ -4369,6 +4419,11 @@ build, test, install or package step -- and --no-native turns execution off.
 When a tool is missing, checkdeps explains how to install it on this platform
 and continues with static manifest analysis.
         """,
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"checkdeps {_version}",
     )
     parser.add_argument(
         "paths",
@@ -4461,8 +4516,23 @@ and continues with static manifest analysis.
         help=f"Time budget for one native resolution "
              f"(default: {DEFAULT_RESOLVER_TIMEOUT})",
     )
+    parser.add_argument(
+        "-r", "--recurse",
+        action="store_true",
+        help="Recurse into subdirectories when scanning a directory",
+    )
+    parser.add_argument(
+        "--clear-cache",
+        action="store_true",
+        help=f"Delete the local vulnerability cache ({CACHE_FILE}) and exit",
+    )
 
     args = parser.parse_args()
+
+    if args.clear_cache:
+        clear_cache()
+        sys.exit(0)
+
     scan_paths = [Path(p) for p in (args.paths or ["."])]
 
     quiet = args.format == "json"
@@ -4488,11 +4558,13 @@ and continues with static manifest analysis.
         offline=args.offline,
         require_native=args.require_native,
         resolver_timeout=args.resolver_timeout,
-        rerun_hint="checkdeps " + " ".join(str(p) for p in scan_paths),
+        rerun_hint="checkdeps " + ("-r " if args.recurse else "")
+                   + " ".join(str(p) for p in scan_paths),
     )
 
     report = discover_and_parse(
-        scan_paths, skip_dev=args.skip_dev, options=options, quiet=quiet
+        scan_paths, skip_dev=args.skip_dev, options=options, quiet=quiet,
+        recurse=args.recurse,
     )
 
     if not report.dependencies:

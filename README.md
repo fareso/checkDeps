@@ -105,6 +105,9 @@ checkdeps pom.xml package.json   # scan specific files
 | `--offline` | Ask native resolvers not to reach the network |
 | `--require-native-resolution` | Exit 1 when an ecosystem's native resolver could not run |
 | `--resolver-timeout SECONDS` | Time budget for one native resolution (default: 300) |
+| `-r`, `--recurse` | Also scan every subdirectory for manifests (skips `node_modules`, `.git`, build output and virtual environments) |
+| `--clear-cache` | Delete the local vulnerability cache and exit |
+| `--version` | Show the installed checkdeps version and exit |
 
 ### Examples
 
@@ -277,9 +280,8 @@ All vulnerability data comes from the [OSV API](https://osv.dev) — free, no AP
 
 Results are cached at `~/.checkDeps/cache.json` with a 2-day TTL. The cache key is `ecosystem::package::version`, so changing a version always triggers a fresh lookup.
 
-To clear the cache manually:
+Expired entries are dropped whenever the cache is written. To clear it completely:
 
 ```bash
-del %USERPROFILE%\.checkDeps\cache.json   # Windows
-rm ~/.checkDeps/cache.json                # macOS / Linux
+checkdeps --clear-cache
 ```

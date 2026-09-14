@@ -4,17 +4,17 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "checkdeps"
-version = "1.0.0"
+version = "1.0.1"
 description = "CVE vulnerability scanner for dependency manifests"
-requires-python = ">=3.11"
+requires-python = "==3.13.4"
 dependencies = [
-    "packaging>=23.2",
-    "requests>=2.33.0",
-    "rich>=13.7.0",
+    "packaging==23.2",
+    "requests==2.33.0",
+    "rich==13.7.0",
 ]
 
 [project.optional-dependencies]
-test = ["pytest>=8.0"]
+test = ["pytest==9.0.3"]
 
 [project.scripts]
 checkdeps = "checkdeps:main"

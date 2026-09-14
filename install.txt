@@ -1,0 +1,4 @@
+python.exe -m pip install --upgrade pip
+pip install -r requirements.txt
+pipx uninstall checkdeps; pipx install --editable . --python 'C:\Users\acido\AppData\Local\Programs\Python\Python313\python.exe'
+checkdeps --version

@@ -10,3 +10,5 @@ dist/
 # Virtual environments
 .venv/
 venv/
+
+.test-tmp-approved/

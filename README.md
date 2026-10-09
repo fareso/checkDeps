@@ -251,6 +251,17 @@ Requirements that fail to parse are reported as errors with their file and line 
 
 ### JSON output
 
+The vulnerability table includes **Next safe version**: the earliest comparable
+fixed-version candidate above the installed version that returns no findings
+from a fresh OSV query. Candidates come from advisory fix boundaries, so this
+is not an exhaustive search of every published release. The check includes all
+OSV severities, even when `--min-severity` hides some findings. `Unknown` means
+no candidate could be verified (for example, no published fix, an unsupported
+version format, or a failed lookup). Project constraints and compatibility are
+not checked. PyPI versions use PEP 440 ordering; other ecosystems currently
+support plain numeric release versions. JSON findings expose the same value
+as `next_safe_version`, or `null` when unknown.
+
 `--format json` prints an object:
 
 ```json

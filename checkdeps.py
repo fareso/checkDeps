@@ -209,6 +209,8 @@ class Vulnerability:
     cvss_score: object  # float or None
     aliases: list = field(default_factory=list)
     published: str = ""
+    fixed_versions: list = field(default_factory=list)
+    next_safe_version: str | None = None
 
 
 
@@ -3735,6 +3737,7 @@ def _vulns_from_cache(entry: dict) -> list:
             cvss_score=v["cvss_score"],
             aliases=v["aliases"],
             published=v["published"],
+            fixed_versions=v.get("fixed_versions", []),
         )
         for v in entry["vulns"]
     ]
@@ -3749,6 +3752,7 @@ def _vulns_to_cache(vulns: list) -> list:
             "cvss_score": v.cvss_score,
             "aliases": v.aliases,
             "published": v.published,
+            "fixed_versions": v.fixed_versions,
         }
         for v in vulns
     ]
@@ -3852,6 +3856,79 @@ def osv_affects(vuln: dict, ecosystem: str, name: str, version: str):
     return False if matched_package else None
 
 
+def _upgrade_version_key(ecosystem: str, version: str):
+    """Compare PyPI versions and plain numeric releases conservatively."""
+    if ecosystem == "PyPI":
+        try:
+            return Version(version)
+        except InvalidVersion:
+            return None
+    if re.fullmatch(r"v?\d+(?:\.\d+)*", version):
+        parts = tuple(int(part) for part in version.lstrip("v").split("."))
+        return parts + (0,) * max(0, 8 - len(parts))
+    return None
+
+
+def _fixed_versions(detail: dict, dep: Dependency) -> list:
+    versions = set()
+    for affected in detail.get("affected", []):
+        package = affected.get("package", {})
+        name = package.get("name", "")
+        if dep.ecosystem == "PyPI":
+            name = canonicalize_name(name)
+        if name != dep.name or package.get("ecosystem") != dep.ecosystem:
+            continue
+        for interval in affected.get("ranges", []):
+            if interval.get("type") == "GIT":
+                continue
+            for event in interval.get("events", []):
+                if event.get("fixed"):
+                    versions.add(event["fixed"])
+    return sorted(versions)
+
+
+def _find_safe_upgrades(deps: list, results: dict) -> None:
+    """Verify advisory fix candidates; failed or incomplete queries stay unknown."""
+    candidates = {}
+    for idx, vulns in results.items():
+        dep = deps[idx]
+        current = _upgrade_version_key(dep.ecosystem, dep.version or "")
+        if current is None or not vulns:
+            continue
+        ordered = []
+        for version in {v for vuln in vulns for v in vuln.fixed_versions}:
+            key = _upgrade_version_key(dep.ecosystem, version)
+            if key is not None and key > current:
+                ordered.append((key, version))
+        for _, version in sorted(ordered):
+            candidates.setdefault((dep.ecosystem, dep.name, version), []).append(idx)
+    keys = list(candidates)
+    safe = {}
+    if not keys:
+        return
+    with requests.Session() as session:
+        for start in range(0, len(keys), OSV_BATCH_LIMIT):
+            batch = keys[start:start + OSV_BATCH_LIMIT]
+            try:
+                response = session.post(OSV_BATCH_URL, json={"queries": [
+                    {"package": {"ecosystem": eco, "name": name}, "version": version}
+                    for eco, name, version in batch
+                ]}, timeout=30)
+                response.raise_for_status()
+                answers = response.json().get("results", [])
+                if len(answers) != len(batch):
+                    continue
+                for key, answer in zip(batch, answers):
+                    if isinstance(answer, dict) and not answer.get("vulns") and not answer.get("next_page_token") and not answer.get("error"):
+                        for idx in candidates[key]:
+                            safe.setdefault(idx, key[2])
+            except (requests.RequestException, ValueError, TypeError, AttributeError):
+                continue
+    for idx, version in safe.items():
+        for vuln in results[idx]:
+            vuln.next_safe_version = version
+
+
 def query_osv(deps: list, quiet: bool = False) -> dict:
     """
     Two-phase OSV query with a 2-day disk cache.
@@ -3882,7 +3959,8 @@ def query_osv(deps: list, quiet: bool = False) -> dict:
             continue
         key = _cache_key(dep)
         entry = cache.get(key)
-        if entry and entry.get("expires", 0) > now:
+        if (entry and entry.get("expires", 0) > now
+                and all("fixed_versions" in v for v in entry.get("vulns", []))):
             results[i] = _vulns_from_cache(entry)
             cache_hits += 1
         else:
@@ -3894,6 +3972,7 @@ def query_osv(deps: list, quiet: bool = False) -> dict:
         )
 
     if not uncached_indices:
+        _find_safe_upgrades(deps, results)
         return results
 
     # Phase 1: batch query OSV for uncached deps only
@@ -3964,6 +4043,7 @@ def query_osv(deps: list, quiet: bool = False) -> dict:
                     cvss_score=score,
                     aliases=aliases,
                     published=detail.get("published", "")[:10],
+                    fixed_versions=_fixed_versions(detail, dep),
                 )
             )
         results[dep_idx] = vulns
@@ -3980,6 +4060,7 @@ def query_osv(deps: list, quiet: bool = False) -> dict:
     if cache_dirty:
         _save_cache(cache)
 
+    _find_safe_upgrades(deps, results)
     return results
 
 
@@ -4221,6 +4302,7 @@ def print_table_output(report: ParseReport, vuln_map: dict, min_severity: str) -
         )
         table.add_column("Package", style="bold", no_wrap=True)
         table.add_column("Version", no_wrap=True)
+        table.add_column("Next safe version", no_wrap=True, style="green")
         table.add_column("Ecosystem", no_wrap=True)
         table.add_column("File", no_wrap=True, style="dim")
         table.add_column("Severity", no_wrap=True, justify="center")
@@ -4234,6 +4316,7 @@ def print_table_output(report: ParseReport, vuln_map: dict, min_severity: str) -
                 table.add_row(
                     dep.display_name if i == 0 else "",
                     dep.version if i == 0 else "",
+                    (vuln.next_safe_version or "Unknown") if i == 0 else "",
                     dep.ecosystem if i == 0 else "",
                     dep.location if i == 0 else "",
                     severity_text(vuln.severity),
@@ -4243,6 +4326,7 @@ def print_table_output(report: ParseReport, vuln_map: dict, min_severity: str) -
                 )
 
         console.print(table)
+        console.print("[dim]Next safe version: earliest advisory fix candidate above the current version with no OSV findings. Unknown means no candidate could be verified; project compatibility is not checked.[/dim]")
 
     _print_unresolved(report)
     _print_issues(report)
@@ -4305,6 +4389,7 @@ def print_json_output(report: ParseReport, vuln_map: dict,
         if not vulns:
             continue
         record = _dependency_json(dep)
+        record["next_safe_version"] = vulns[0].next_safe_version
         record["vulnerabilities"] = [
             {
                 "id": v.vuln_id,

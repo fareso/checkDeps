@@ -384,6 +384,37 @@ def test_different_versions_are_not_deduplicated():
     assert len(_dedupe([dep("1.0"), dep("2.0")])) == 2
 
 
+def test_repeated_maven_dependency_does_not_hide_its_transitive_children():
+    tree = {
+        "groupId": "org.example", "artifactId": "app", "version": "1.0",
+        "children": [
+            {
+                "groupId": "org.example", "artifactId": "first", "version": "1.0",
+                "children": [{
+                    "groupId": "org.example", "artifactId": "shared", "version": "1.0"
+                }],
+            },
+            {
+                "groupId": "org.example", "artifactId": "second", "version": "1.0",
+                "children": [{
+                    "groupId": "org.example", "artifactId": "shared", "version": "1.0",
+                    "children": [{
+                        "groupId": "org.vulnerable", "artifactId": "transitive",
+                        "version": "2.3.4",
+                    }],
+                }],
+            },
+        ],
+    }
+    dependencies = {}
+
+    _dependencies_from_tree(tree, "pom.xml", dependencies)
+
+    names = by_name(dependencies.values())
+    assert names["org.vulnerable:transitive"].version == "2.3.4"
+    assert names["org.vulnerable:transitive"].direct is False
+
+
 # ---------------------------------------------------------------------------
 # Execution: command construction and the full path through a child process
 # ---------------------------------------------------------------------------

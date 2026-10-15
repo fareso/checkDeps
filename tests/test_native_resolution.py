@@ -658,6 +658,33 @@ def test_npm_lockfile_v3_gives_direct_and_transitive_versions(tmp_path):
     assert "ui" not in deps            # a workspace link is not a package
 
 
+def test_npm_lockfile_uses_real_registry_name_for_an_alias(tmp_path):
+    package = {
+        "name": "app",
+        "dependencies": {"safe-name": "npm:vulnerable-package@1.2.3"},
+    }
+    lock = {
+        "name": "app",
+        "lockfileVersion": 3,
+        "packages": {
+            "": package,
+            "node_modules/safe-name": {
+                "name": "vulnerable-package",
+                "version": "1.2.3",
+            },
+        },
+    }
+    project = tmp_path / "aliased-npm-project"
+    write(project / "package.json", json.dumps(package))
+    write(project / "package-lock.json", json.dumps(lock))
+
+    dependencies = by_name(scan(project).dependencies)
+
+    assert "safe-name" not in dependencies
+    assert dependencies["vulnerable-package"].version == "1.2.3"
+    assert dependencies["vulnerable-package"].direct is True
+
+
 def test_npm_lockfile_v1_is_read_too(tmp_path):
     project = npm_project(tmp_path)
     write(project / "package-lock.json", json.dumps(LOCK_V1))

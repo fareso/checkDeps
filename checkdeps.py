@@ -1857,21 +1857,24 @@ def _dependencies_from_tree(tree, source: str, into: dict,
             existing.direct = existing.direct or direct
             if source != existing.source_file and source not in existing.also_used_by:
                 existing.also_used_by.append(source)
-            return
-        into[key] = Dependency(
-            name=name,
-            version=coords["version"],
-            ecosystem="Maven",
-            source_file=source,
-            is_dev=coords["scope"] in MAVEN_DEV_SCOPES,
-            resolution="native",
-            resolver=resolver_id,
-            introduced_by=parent,
-            scope=coords["scope"],
-            direct=direct,
-            artifact_type=coords["type"],
-            classifier=coords["classifier"],
-        )
+        else:
+            into[key] = Dependency(
+                name=name,
+                version=coords["version"],
+                ecosystem="Maven",
+                source_file=source,
+                is_dev=coords["scope"] in MAVEN_DEV_SCOPES,
+                resolution="native",
+                resolver=resolver_id,
+                introduced_by=parent,
+                scope=coords["scope"],
+                direct=direct,
+                artifact_type=coords["type"],
+                classifier=coords["classifier"],
+            )
+        # Do not stop at an already-seen coordinate. Maven may omit a repeated
+        # subtree on one path and include it on another; its children can
+        # therefore still contain packages that have not been scanned.
         for child in node.get("children") or []:
             walk(child, False, name)
 
@@ -2437,12 +2440,19 @@ class NpmLockResolver(LockfileResolver):
                 version = entry.get("version")
                 if not isinstance(version, str) or not version:
                     continue
-                name = location.rsplit("node_modules/", 1)[1]
+                installed_name = location.rsplit("node_modules/", 1)[1]
+                # npm aliases keep the alias in the installation path but
+                # record the registry package's real name in the entry. OSV
+                # indexes that real name, not the local alias.
+                recorded_name = entry.get("name")
+                name = (recorded_name.strip()
+                        if isinstance(recorded_name, str) and recorded_name.strip()
+                        else installed_name)
                 _merge_dependency(collected, _npm_dependency(
                     name, version, source, self.id,
-                    direct=name in direct_names,
+                    direct=installed_name in direct_names or name in direct_names,
                     is_dev=bool(entry.get("dev") or entry.get("devOptional"))
-                    or name in dev_names,
+                    or installed_name in dev_names or name in dev_names,
                 ))
         else:
             # Lockfile v1: a nested tree under "dependencies".
